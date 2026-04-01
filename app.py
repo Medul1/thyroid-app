@@ -1,40 +1,34 @@
 import streamlit as st
 import joblib
 import numpy as np
+import pandas as pd
 import json
+import shap
 import matplotlib.pyplot as plt
 
 # ---------------------------
-# Load Model
+# Load Model & Explainer
 # ---------------------------
-model = joblib.load("thyroid_model.pkl")
+@st.cache_resource
+def load_resources():
+    model = joblib.load("thyroid_model.pkl")
+    explainer = shap.TreeExplainer(model)
+    return model, explainer
 
 # ---------------------------
 # Load Users
 # ---------------------------
-with open("users.json") as f:
-    users = json.load(f)
+try:
+    with open("users.json") as f:
+        users = json.load(f)
+except FileNotFoundError:
+    st.error("users.json file not found. Please upload it to GitHub.")
+    st.stop()
 
 # ---------------------------
 # Page Config
 # ---------------------------
 st.set_page_config(page_title="Thyroid AI", layout="centered")
-
-# ---------------------------
-# Custom UI Style (Modern)
-# ---------------------------
-st.markdown("""
-    <style>
-    .main {background-color: #f5f7fa;}
-    .stButton>button {
-        background-color: #4CAF50;
-        color: white;
-        border-radius: 10px;
-        height: 3em;
-        width: 100%;
-    }
-    </style>
-""", unsafe_allow_html=True)
 
 # ---------------------------
 # Login System
@@ -50,6 +44,7 @@ def login():
     if st.button("Login"):
         if username in users and users[username] == password:
             st.session_state.login = True
+            st.rerun()
         else:
             st.error("Invalid Login")
 
@@ -58,10 +53,10 @@ if not st.session_state.login:
     st.stop()
 
 # ---------------------------
-# Main UI
+# Main App UI
 # ---------------------------
 st.title("🧠 Thyroid Disease Prediction System")
-st.markdown("### AI-based Smart Diagnosis with Explainable AI")
+st.markdown("### AI-based Smart Diagnosis Tool")
 
 # ---------------------------
 # Input Section
@@ -69,83 +64,59 @@ st.markdown("### AI-based Smart Diagnosis with Explainable AI")
 st.subheader("Enter Patient Details")
 
 col1, col2 = st.columns(2)
-
 with col1:
     age = st.slider("Age", 1, 100, 30)
-    tsh = st.number_input("TSH Level", value=2.0)
-
+    tsh = st.number_input("TSH Level", value=6.0)
 with col2:
-    fti = st.number_input("FTI Level", value=100.0)
-
-# Feature Engineering
-tsh_fti_ratio = tsh / (fti + 0.001)
+    fti = st.number_input("FTI Level", value=50.0)
+    # Ratio calculation
+    tsh_fti_ratio = tsh / (fti + 0.001)
 
 # ---------------------------
-# Prediction
+# Prediction & Explanation
 # ---------------------------
-if st.button("Predict Diagnosis"):
+model, explainer = load_resources()
 
-    features = np.array([[age, tsh, fti, tsh_fti_ratio]])
+if st.button("Predict"):
+    # মডেলের রিকোয়ারমেন্ট অনুযায়ী ২৮টি কলামের ডাটাফ্রেম তৈরি
+    data = {
+        'age': [age], 'sex': [0], 'on thyroxine': [0], 'query on thyroxine': [0],
+        'on antithyroid medication': [0], 'sick': [0], 'pregnant': [0], 
+        'thyroid surgery': [0], 'I131 treatment': [0], 'query hypothyroid': [0],
+        'query hyperthyroid': [0], 'lithium': [0], 'goitre': [0], 'tumor': [0],
+        'hypopituitary': [0], 'psych': [0], 'TSH measured': [1], 'TSH': [tsh],
+        'T3 measured': [0], 'TT4 measured': [0], 'TT4': [0], 'T4U measured': [0],
+        'T4U': [0], 'FTI measured': [1], 'FTI': [fti],
+        'TSH_FTI_Ratio': [tsh_fti_ratio], 'Age_Group': [0], 'Symptom_Score': [0]
+    }
+    features = pd.DataFrame(data)
 
+    # প্রেডিকশন
     prediction = model.predict(features)[0]
+    prob = model.predict_proba(features)[0][1] * 100
 
-    # Real Confidence
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(features)[0]
-        confidence = max(proba) * 100
-    else:
-        confidence = np.random.uniform(90, 98)
-
-    # ---------------------------
-    # Result
-    # ---------------------------
-    st.subheader("🩺 Prediction Result")
+    st.markdown("---")
+    st.subheader("Result")
 
     if prediction == 1:
-        st.error(f"⚠️ Thyroid Disease Detected ({confidence:.2f}% Confidence)")
+        st.error(f"⚠️ Thyroid Disease Detected ({prob:.2f}%)")
     else:
-        st.success(f"✅ Healthy ({confidence:.2f}% Confidence)")
+        st.success(f"✅ Healthy ({100-prob:.2f}%)")
 
     # ---------------------------
-    # Graph Visualization
+    # Explainable AI (SHAP)
     # ---------------------------
-    st.subheader("📊 Visualization")
-
-    fig, ax = plt.subplots()
-    labels = ['TSH', 'FTI', 'Ratio']
-    values = [tsh, fti, tsh_fti_ratio]
-
-    ax.bar(labels, values)
-    ax.set_title("Patient Hormone Levels")
-
+    st.markdown("---")
+    st.subheader("🔍 Model Explanation (SHAP)")
+    st.write("This chart explains how the AI analyzed the inputs.")
+    
+    shap_values = explainer(features)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    shap.plots.waterfall(shap_values[0], show=False) # কোলাব নোটবুকের মতো গ্রাফ
     st.pyplot(fig)
-
-    # ---------------------------
-    # Explainable AI Section
-    # ---------------------------
-    st.subheader("🔍 Explainable AI Insight")
-
-    st.write(f"TSH: {tsh}")
-    st.write(f"FTI: {fti}")
-    st.write(f"TSH/FTI Ratio: {round(tsh_fti_ratio,2)}")
-
-    # Rule-based explanation (clear for teacher)
-    if tsh > 4:
-        st.warning("High TSH → Possible Hypothyroidism")
-    elif tsh < 0.4:
-        st.warning("Low TSH → Possible Hyperthyroidism")
-    else:
-        st.info("TSH is in normal range")
-
-    if tsh_fti_ratio > 0.05:
-        st.write("High Ratio → Hormonal imbalance detected")
-    else:
-        st.write("Ratio is within normal range")
-
-    st.success("This explanation helps doctors understand the AI decision (Explainable AI)")
 
 # ---------------------------
 # Footer
 # ---------------------------
 st.markdown("---")
-st.markdown("🚀 Developed for Thesis | AI in Healthcare | Explainable AI Enabled")
+st.markdown("Developed for Thesis Project | AI in Healthcare")
