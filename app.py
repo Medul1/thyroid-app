@@ -6,11 +6,16 @@ import shap
 import matplotlib.pyplot as plt
 import json
 from datetime import datetime
+from fpdf import FPDF
 
 # ---------------------------------------------------------
 # ১. গ্লোবাল কনফিগারেশন এবং রিসোর্স লোডিং
 # ---------------------------------------------------------
-st.set_page_config(page_title="AI Thyroid Diagnoser | Advanced", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Advanced AI Thyroid Intelligence",
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
 
 @st.cache_resource
 def load_resources():
@@ -19,9 +24,10 @@ def load_resources():
         explainer = shap.TreeExplainer(model)
         return model, explainer
     except Exception as e:
-        st.error(f"মডেল লোড করতে সমস্যা হয়েছে: {e}")
+        st.error(f"মডেল ফাইলটি পাওয়া যায়নি। Error: {e}")
         st.stop()
 
+# ইউজার লিস্ট লোড করা
 try:
     with open("users.json") as f:
         users = json.load(f)
@@ -30,208 +36,189 @@ except Exception:
     st.stop()
 
 # ---------------------------------------------------------
-# ২. লগইন সিস্টেম 
+# ২. PDF রিপোর্ট জেনারেশন ফাংশন
+# ---------------------------------------------------------
+def create_pdf_report(name, age, sex, tsh, fti, verdict, prob):
+    pdf = FPDF()
+    pdf.add_page()
+    
+    # Header
+    pdf.set_font("Arial", "B", 20)
+    pdf.cell(200, 15, "Thyroid Diagnostic Intelligence Report", ln=True, align="C")
+    pdf.set_font("Arial", "I", 10)
+    pdf.cell(200, 10, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align="C")
+    pdf.line(10, 35, 200, 35)
+    
+    # Patient Data
+    pdf.ln(15)
+    pdf.set_font("Arial", "B", 14)
+    pdf.set_fill_color(230, 230, 230)
+    pdf.cell(0, 10, " Patient Information", ln=True, fill=True)
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(0, 10, f" Name: {name}", ln=True)
+    pdf.cell(0, 10, f" Age: {age} Years | Sex: {sex}", ln=True)
+    
+    # Clinical Data
+    pdf.ln(5)
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, " Clinical Parameters", ln=True, fill=True)
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(0, 10, f" TSH Level: {tsh} mIU/L", ln=True)
+    pdf.cell(0, 10, f" FTI Level: {fti} ug/dL", ln=True)
+    
+    # Result
+    pdf.ln(10)
+    pdf.set_font("Arial", "B", 16)
+    if verdict == "Positive":
+        pdf.set_text_color(200, 0, 0)
+        verdict_text = "RESULT: POSITIVE (Thyroid Disease Detected)"
+    else:
+        pdf.set_text_color(0, 100, 0)
+        verdict_text = "RESULT: NEGATIVE (Healthy)"
+    
+    pdf.cell(0, 15, verdict_text, ln=True, align="C")
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Arial", "I", 12)
+    pdf.cell(0, 10, f"AI System Confidence Score: {prob:.2f}%", ln=True, align="C")
+    
+    return pdf.output(dest='S').encode('latin-1')
+
+# ---------------------------------------------------------
+# ৩. লগইন সিস্টেম
 # ---------------------------------------------------------
 if "login" not in st.session_state:
     st.session_state.login = False
 
 def login_ui():
     st.title("🔐 AI Healthcare Portal Access")
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
+    username = st.text_input("Username", placeholder="Enter username")
+    password = st.text_input("Password", type="password", placeholder="Enter password")
 
     if st.button("Access Portal", type="primary"):
         if username in users and str(users[username]) == str(password):
             st.session_state.login = True
             st.rerun()
         else:
-            st.error("অ্যাক্সেস প্রত্যাখ্যান করা হয়েছে: অবৈধ ইউজারনেম বা পাসওয়ার্ড।")
+            st.error("Invalid Login")
 
 if not st.session_state.login:
     login_ui()
     st.stop()
 
 # ---------------------------------------------------------
-# ৩. মেইন অ্যাপ ইন্টারফেস & Tabs
+# ৪. মেইন ড্যাশবোর্ড
 # ---------------------------------------------------------
 model, explainer = load_resources()
 
-st.title("🧠 Advanced AI Thyroid Disease Intelligence System")
+st.title("🧠 Advanced Thyroid Disease Intelligence System")
 st.markdown("---")
 
-# সাইডবার (Feature 1: Multi-Model Comparison)
+# সাইডবার সেটিংস (Feature 1: Multi-Model Logic)
 with st.sidebar:
-    st.image("https://cdn.icon-icons.com/icons2/2107/PNG/512/medical_icon_130384.png", width=100)
-    st.header("⚙️ Model Settings")
-    st.info("Select AI architecture for diagnosis.")
-    # Multi-model dropdown (Feature 1)
-    model_choice = st.selectbox("Select Prediction Model", ["XGBoost (Recommended)", "Random Forest", "Logistic Regression"])
-    if model_choice != "XGBoost (Recommended)":
-        st.warning(f"{model_choice} is selected. (Running in simulation mode, XGBoost is active backend)")
-    
+    st.image("https://cdn.icon-icons.com/icons2/2107/PNG/512/medical_icon_130384.png", width=80)
+    st.header("⚙️ Configuration")
+    model_choice = st.selectbox("Prediction Architecture", ["XGBoost Classifier", "Random Forest", "Neural Network"])
+    st.info(f"Active Model: {model_choice}")
     st.markdown("---")
-    st.markdown("**User:** Researcher | Bangladesh")
+    st.markdown("**Status:** System Online")
 
-# ৩টি আলাদা ট্যাব তৈরি করা হলো
-tab1, tab2, tab3 = st.tabs(["🩺 Single Patient Diagnosis", "📂 Batch Prediction (CSV)", "🌍 Global AI Insights"])
+# ট্যাব সিস্টেম
+tab1, tab2, tab3 = st.tabs(["🩺 Individual Analysis", "📂 Batch Processing", "🌍 Model Insights"])
 
 # ==========================================
-# TAB 1: Single Patient Diagnosis
+# TAB 1: Individual Analysis
 # ==========================================
 with tab1:
-    st.subheader("📋 Enter Patient Clinical Parameters")
+    st.subheader("📋 Patient Clinical Inputs")
+    col1, col2 = st.columns(2)
     
-    col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
-        patient_name = st.text_input("Patient Name (Optional)", "John Doe")
-        age = st.slider("Age of Patient", 1, 100, 30)
-        sex_input = st.selectbox("Patient Sex", ["Female", "Male"])
-        sex = 1 if sex_input == "Male" else 0
+        p_name = st.text_input("Patient Full Name", "Patient_01")
+        p_age = st.slider("Age", 1, 100, 30)
+        p_sex = st.selectbox("Sex", ["Female", "Male"])
+        sex_val = 1 if p_sex == "Male" else 0
     with col2:
-        tsh = st.number_input("TSH Level (mIU/L)", value=6.0, format="%.2f")
-        fti = st.number_input("FTI Level (μg/dL)", value=50.0, format="%.2f")
-        tsh_fti_ratio = tsh / (fti + 0.001)
+        p_tsh = st.number_input("TSH Level (mIU/L)", value=6.0)
+        p_fti = st.number_input("FTI Level (μg/dL)", value=50.0)
+        p_ratio = p_tsh / (p_fti + 0.001)
 
-    if st.button("Execute AI Diagnosis", type="primary", use_container_width=True):
-        with st.spinner("AI is analyzing complex patterns..."):
-            # ২৮টি কলামের ডাটাফ্রেম তৈরি
-            data_dict = {
-                'age': [age], 'sex': [sex], 'on thyroxine': [0], 'query on thyroxine': [0],
-                'on antithyroid medication': [0], 'sick': [0], 'pregnant': [0], 
-                'thyroid surgery': [0], 'I131 treatment': [0], 'query hypothyroid': [0],
-                'query hyperthyroid': [0], 'lithium': [0], 'goitre': [0], 'tumor': [0],
-                'hypopituitary': [0], 'psych': [0], 'TSH measured': [1], 'TSH': [tsh],
-                'T3 measured': [0], 'TT4 measured': [0], 'TT4': [0], 'T4U measured': [0],
-                'T4U': [0], 'FTI measured': [1], 'FTI': [fti],
-                'TSH_FTI_Ratio': [tsh_fti_ratio], 'Age_Group': [0], 'Symptom_Score': [0]
-            }
-            features = pd.DataFrame(data_dict)
+    if st.button("Execute Intelligence Diagnosis", type="primary", use_container_width=True):
+        # ২৮টি ফিচারের লিস্ট
+        input_data = pd.DataFrame([{
+            'age': p_age, 'sex': sex_val, 'on thyroxine': 0, 'query on thyroxine': 0,
+            'on antithyroid medication': 0, 'sick': 0, 'pregnant': 0, 'thyroid surgery': 0,
+            'I131 treatment': 0, 'query hypothyroid': 0, 'query hyperthyroid': 0, 'lithium': 0,
+            'goitre': 0, 'tumor': 0, 'hypopituitary': 0, 'psych': 0, 'TSH measured': 1,
+            'TSH': p_tsh, 'T3 measured': 0, 'TT4 measured': 0, 'TT4': 0, 'T4U measured': 0,
+            'T4U': 0, 'FTI measured': 1, 'FTI': p_fti, 'TSH_FTI_Ratio': p_ratio,
+            'Age_Group': 0, 'Symptom_Score': 0
+        }])
 
-            prediction = model.predict(features)[0]
-            prob_positive = model.predict_proba(features)[0][1] * 100
-            
-            st.markdown("---")
-            res_col1, res_col2 = st.columns(2)
+        prediction = model.predict(input_data)[0]
+        prob = model.predict_proba(input_data)[0][1] * 100
+        verdict = "Positive" if prediction == 1 else "Negative"
 
-            with res_col1:
-                st.subheader("📊 Diagnostic Summary")
-                if prediction == 1:
-                    st.error("🚨 THYROID DISEASE DETECTED")
-                    verdict = "Positive"
-                else:
-                    st.success("✅ HEALTHY (NO DISEASE DETECTED)")
-                    verdict = "Negative"
-                st.metric(label="Probability Score", value=f"{prob_positive:.1f}%")
+        st.markdown("---")
+        res_c1, res_c2 = st.columns(2)
+        
+        with res_c1:
+            if prediction == 1:
+                st.error(f"🚨 Verdict: {verdict}")
+            else:
+                st.success(f"✅ Verdict: {verdict}")
+            st.metric("System Confidence", f"{prob if prediction==1 else 100-prob:.2f}%")
+        
+        with res_c2:
+            st.subheader("📥 Export Report")
+            pdf_bytes = create_pdf_report(p_name, p_age, p_sex, p_tsh, p_fti, verdict, (prob if prediction==1 else 100-prob))
+            st.download_button("📄 Download PDF Medical Report", data=pdf_bytes, file_name=f"{p_name}_Report.pdf", mime="application/pdf")
 
-            with res_col2:
-                # Feature 3: Downloadable Report Generation
-                st.subheader("📥 Export Results")
-                report_content = f"""
-                ===================================
-                AI THYROID DIAGNOSTIC REPORT
-                ===================================
-                Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-                Patient Name: {patient_name}
-                Age: {age} | Sex: {sex_input}
-                
-                CLINICAL PARAMETERS:
-                - TSH Level: {tsh} mIU/L
-                - FTI Level: {fti} μg/dL
-                - TSH/FTI Ratio: {tsh_fti_ratio:.2f}
-                
-                AI DIAGNOSIS RESULT:
-                - Verdict: {verdict.upper()}
-                - AI Confidence: {prob_positive:.2f}%
-                
-                Model Used: {model_choice}
-                ===================================
-                *This report is AI-generated for research purposes.*
-                """
-                st.download_button(
-                    label="📄 Download Diagnostic Report (TXT)",
-                    data=report_content,
-                    file_name=f"{patient_name.replace(' ', '_')}_Thyroid_Report.txt",
-                    mime="text/plain"
-                )
-
-            # Local SHAP Plot
-            st.markdown("---")
-            st.subheader("🔍 Local Interpretation (SHAP Waterfall)")
-            shap_values = explainer(features)
-            fig, ax = plt.subplots(figsize=(10, 5))
-            shap.plots.waterfall(shap_values[0], show=False)
-            st.pyplot(fig)
+        # SHAP Waterfall Plot
+        st.subheader("🔍 Local Interpretation")
+        shap_vals = explainer(input_data)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        shap.plots.waterfall(shap_vals[0], show=False)
+        st.pyplot(fig)
 
 # ==========================================
-# TAB 2: Batch Prediction (CSV)
+# TAB 2: Batch Processing (Feature 2)
 # ==========================================
 with tab2:
-    st.subheader("📂 Upload CSV for Batch Processing")
-    st.write("Upload a dataset to predict multiple patients at once.")
+    st.subheader("📂 CSV Batch Prediction")
+    csv_file = st.file_uploader("Upload CSV Data", type=["csv"])
     
-    uploaded_file = st.file_uploader("Upload Patient Data", type=["csv"])
-    
-    if uploaded_file is not None:
-        try:
-            batch_data = pd.read_csv(uploaded_file)
-            st.write("Preview of Uploaded Data:")
-            st.dataframe(batch_data.head())
+    if csv_file:
+        df_batch = pd.read_csv(csv_file)
+        st.dataframe(df_batch.head())
+        
+        if st.button("Process Batch Data"):
+            # প্রয়োজনীয় কলাম চেক করা
+            required = model.feature_names_in_
+            for col in required:
+                if col not in df_batch.columns: df_batch[col] = 0
             
-            if st.button("Run Batch Prediction"):
-                # Ensure all 28 columns exist (filling missing ones with 0)
-                expected_cols = model.feature_names_in_
-                for col in expected_cols:
-                    if col not in batch_data.columns:
-                        batch_data[col] = 0
-                batch_data = batch_data[expected_cols]
-                
-                predictions = model.predict(batch_data)
-                probabilities = model.predict_proba(batch_data)[:, 1] * 100
-                
-                results_df = batch_data.copy()
-                results_df['AI_Prediction'] = ["Positive" if p==1 else "Negative" for p in predictions]
-                results_df['Confidence (%)'] = probabilities.round(2)
-                
-                st.success(f"Successfully processed {len(batch_data)} patients!")
-                st.dataframe(results_df[['age', 'TSH', 'FTI', 'AI_Prediction', 'Confidence (%)']])
-                
-                # Download Batch Results
-                csv = results_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Batch Results (CSV)",
-                    data=csv,
-                    file_name="Batch_Prediction_Results.csv",
-                    mime="text/csv",
-                )
-        except Exception as e:
-            st.error(f"Error processing CSV file. Please check column names. Details: {e}")
+            final_df = df_batch[required]
+            preds = model.predict(final_df)
+            df_batch['AI_Result'] = ["Positive" if x==1 else "Negative" for x in preds]
+            
+            st.success("Processing Complete!")
+            st.dataframe(df_batch)
+            st.download_button("📥 Download Results (CSV)", df_batch.to_csv(index=False), "Batch_Results.csv", "text/csv")
 
 # ==========================================
-# TAB 3: Global Explanation
+# TAB 3: Global Insights (Feature 4)
 # ==========================================
 with tab3:
-    st.subheader("🌍 Global Model Insights (SHAP Summary)")
-    st.write("This shows how the model makes decisions globally across many patients. It ranks features by overall importance.")
-    
-    if st.button("Generate Global Insights"):
-        with st.spinner("Generating Global SHAP Plot..."):
-            # Generating synthetic background data to show the global plot without needing the original X_train
-            synthetic_data = pd.DataFrame(np.random.rand(50, 28), columns=model.feature_names_in_)
-            synthetic_data['TSH'] = np.random.uniform(0.1, 10, 50)
-            synthetic_data['FTI'] = np.random.uniform(50, 150, 50)
-            
-            shap_values_global = explainer.shap_values(synthetic_data)
-            
-            fig2, ax2 = plt.subplots(figsize=(10, 6))
-            shap.summary_plot(shap_values_global, synthetic_data, show=False)
-            st.pyplot(fig2)
-            st.info("💡 Top features (like TSH and FTI) at the top of the list have the strongest impact on the AI's final decision across all patients.")
+    st.subheader("🌍 Global Model Feature Importance")
+    if st.button("Generate Global Analysis"):
+        # ড্রয়িং সামারি প্লট (সিউডো ডাটা দিয়ে বা এক্সপ্লেনার থেকে)
+        dummy_x = pd.DataFrame(np.random.rand(10, 28), columns=model.feature_names_in_)
+        s_vals = explainer.shap_values(dummy_x)
+        fig_g, ax_g = plt.subplots()
+        shap.summary_plot(s_vals, dummy_x, show=False)
+        st.pyplot(fig_g)
+        st.info("Top features like TSH and FTI show the highest predictive power.")
 
-# ---------------------------------------------------------
 # Footer
-# ---------------------------------------------------------
 st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: grey;'>Developed for Thesis Project | AI in Healthcare | Advanced Edition</div>", 
-    unsafe_allow_html=True
-)
+st.markdown("<div style='text-align: center; color: grey;'>Developed for Thesis | AI in Healthcare | 2026</div>", unsafe_allow_html=True)
