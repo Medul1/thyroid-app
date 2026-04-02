@@ -182,6 +182,9 @@ if st.button("Execute AI Diagnosis", type="primary", use_container_width=True):
 # ---------------------------------------------------------
 # ৭. Footer
 # ---------------------------------------------------------
+# ---------------------------------------------------------
+# ৭. Footer (Fixing the TypeError)
+# ---------------------------------------------------------
 st.markdown("---")
 st.markdown(
     """
@@ -189,5 +192,5 @@ st.markdown(
     Developed for Thesis Project | Artificial Intelligence in Healthcare | Researcher Midul | Bangladesh
     </div>
     """, 
-    unsafe_allow_stdio=True
+    unsafe_allow_html=True  # এখানে stdio এর বদলে html হবে
 )
