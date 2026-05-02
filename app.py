@@ -18,6 +18,7 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings("ignore")
 from reportlab.lib import colors
+NAVY = colors.HexColor("#0F2041")
 
 # =============================================================================
 # PAGE CONFIGURATION
