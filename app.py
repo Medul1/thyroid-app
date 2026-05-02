@@ -17,6 +17,7 @@ import shap
 from datetime import datetime
 import warnings
 warnings.filterwarnings("ignore")
+from reportlab.lib import colors
 
 # =============================================================================
 # PAGE CONFIGURATION
