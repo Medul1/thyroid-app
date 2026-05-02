@@ -9,16 +9,27 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 import xgboost as xgb
-import shap 
+import shap
+import io
 from datetime import datetime
 import warnings
 warnings.filterwarnings("ignore")
+
+# ── ReportLab PDF generation ──
+from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-NAVY = colors.HexColor("#0F2041")
+from reportlab.lib.units import cm
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer,
+    Table, TableStyle, HRFlowable
+)
 
 # =============================================================================
 # PAGE CONFIGURATION
@@ -967,30 +978,61 @@ def show_dashboard(models):
     # TAB 5 — REPORT
     # =========================================================================
     with tabs[4]:
-        st.markdown("<div class='section-heading'>Downloadable Clinical Report</div>",
+        st.markdown("<div class='section-heading'>Downloadable Clinical Report (PDF)</div>",
                     unsafe_allow_html=True)
         if st.session_state.prediction_done and st.session_state.results:
             r = st.session_state.results
-            report = generate_report(
-                r["age"], r["tsh"], r["fti"], r["ratio"],
-                r["pred_label"], r["confidence"],
-                r["sv"], models["feature_names"]
-            )
-            st.code(report, language="text")
+
+            # ── Preview card ──
+            is_pos = r["pred_label"] == "POSITIVE"
+            icon   = "🔴" if is_pos else "🟢"
+            st.markdown(f"""
+            <div class='card'>
+                <div class='card-title'>Report Preview</div>
+                <table style='width:100%;font-size:0.88rem;color:#334;'>
+                  <tr><td style='padding:4px 0;width:40%;'><b>Patient Age</b></td>
+                      <td>{r['age']} years</td></tr>
+                  <tr><td style='padding:4px 0;'><b>TSH</b></td>
+                      <td>{r['tsh']:.4f} mIU/L</td></tr>
+                  <tr><td style='padding:4px 0;'><b>FTI</b></td>
+                      <td>{r['fti']:.2f}</td></tr>
+                  <tr><td style='padding:4px 0;'><b>TSH/FTI Ratio</b></td>
+                      <td>{r['ratio']:.6f}</td></tr>
+                  <tr><td style='padding:4px 0;'><b>Prediction</b></td>
+                      <td>{icon} <b>{r['pred_label']}</b></td></tr>
+                  <tr><td style='padding:4px 0;'><b>Confidence</b></td>
+                      <td>{r['confidence']:.1f}%</td></tr>
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ── Generate PDF ──
+            with st.spinner("📄 Building PDF report…"):
+                pdf_bytes = generate_pdf_report(
+                    r["age"], r["tsh"], r["fti"], r["ratio"],
+                    r["pred_label"], r["confidence"], r["prob"],
+                    r["sv"], models["feature_names"]
+                )
+
+            fname = f"ThyroPredict_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
             st.download_button(
-                label="⬇️ Download Report (.txt)",
-                data=report.encode("utf-8"),
-                file_name=f"ThyroPredict_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain"
+                label="⬇️  Download PDF Report",
+                data=pdf_bytes,
+                file_name=fname,
+                mime="application/pdf",
             )
             st.markdown("""
             <div class='info-box' style='margin-top:1rem;'>
+            📄 The PDF includes: Patient biomarker values, Prediction result with confidence,
+            SHAP explainability table, Clinical interpretation and recommendation, Disclaimer.
+            </div>
+            <div class='info-box' style='background:#FFF8E1;border-color:#F9A825;color:#5D4037;'>
             ⚠️ <b>Disclaimer:</b> This report is AI-generated for research and educational
             purposes only. It does not constitute medical advice and must not replace
             professional clinical diagnosis.
             </div>""", unsafe_allow_html=True)
         else:
-            st.info("ℹ️ Run a prediction first (Tab 1) to generate the report.")
+            st.info("ℹ️ Run a prediction first (Tab 1) to generate the PDF report.")
 
 
 # =============================================================================
