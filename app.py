@@ -1,4 +1,3 @@
-import matplotlib.pyplot as plt
 import streamlit as st
 import joblib
 import pandas as pd
@@ -7,22 +6,17 @@ import shap
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+import matplotlib.pyplot as plt
 import json
-import warnings
 from datetime import datetime
 from fpdf import FPDF
+from pathlib import Path
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-
-warnings.filterwarnings("ignore")
 
 # =========================================================
-# PAGE CONFIG
+# Page config
 # =========================================================
 st.set_page_config(
     page_title="Explainable Thyroid AI",
@@ -32,7 +26,7 @@ st.set_page_config(
 )
 
 # =========================================================
-# GLOBAL STYLE
+# UI style
 # =========================================================
 st.markdown(
     """
@@ -43,9 +37,6 @@ st.markdown(
     }
     [data-testid="stHeader"] {
         background: rgba(0,0,0,0);
-    }
-    [data-testid="stToolbar"] {
-        right: 12px;
     }
     .block-container {
         padding-top: 1.2rem;
@@ -117,20 +108,19 @@ st.markdown(
 )
 
 # =========================================================
-# NORMAL RANGES
+# Clinical ranges
 # =========================================================
 TSH_NORMAL = (0.4, 4.0)
 FTI_NORMAL = (60.0, 160.0)
 RATIO_NORMAL = (0.003, 0.067)
 
 # =========================================================
-# HELPERS
+# Helpers
 # =========================================================
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = df.columns.astype(str).str.strip()
     return df
-
 
 def detect_target_column(df: pd.DataFrame) -> str | None:
     candidates = [
@@ -142,103 +132,339 @@ def detect_target_column(df: pd.DataFrame) -> str | None:
             return c
     return None
 
-
 def detect_age_column(df: pd.DataFrame) -> str | None:
     for c in df.columns:
         if c.lower() == "age":
             return c
     return None
 
-
-def is_positive_label(value) -> bool:
-    s = str(value).strip().lower()
-    positive_tokens = ["positive", "disease", "diseased", "abnormal", "hyper", "hypo", "yes", "1"]
-    negative_tokens = ["negative", "normal", "healthy", "no", "0"]
-
-    if any(tok in s for tok in positive_tokens) and not any(tok in s for tok in negative_tokens):
-        return True
-    if any(tok in s for tok in negative_tokens):
-        return False
-
-    try:
-        return int(float(value)) == 1
-    except Exception:
-        return False
-
-
 def label_to_text(value) -> str:
-    return "Positive" if is_positive_label(value) else "Negative"
+    try:
+        return "Positive" if int(value) == 1 else "Negative"
+    except Exception:
+        s = str(value).strip().lower()
+        if s in ["positive", "disease", "diseased", "abnormal", "hyper", "hypo", "yes"]:
+            return "Positive"
+        return "Negative"
 
+def get_available_model_files():
+    model_files = {
+        "XGBoost": "xgboost_model.pkl",
+        "Random Forest": "random_forest_model.pkl",
+        "Logistic Regression": "logistic_regression_model.pkl",
+        "Decision Tree": "decision_tree_model.pkl",
+        "SVM": "svm_model.pkl",
+    }
+    available = {}
+    for name, file in model_files.items():
+        if Path(file).exists():
+            available[name] = file
 
-def safe_feature_list(model, df: pd.DataFrame, target_col: str | None) -> list[str]:
-    if hasattr(model, "feature_names_in_"):
-        return [str(c) for c in model.feature_names_in_]
-    cols = [c for c in df.columns if c != target_col]
-    numeric_cols = []
-    for c in cols:
-        if pd.api.types.is_numeric_dtype(df[c]):
-            numeric_cols.append(c)
-    return numeric_cols
+    # fallback to old single-model file
+    if not available and Path("thyroid_model.pkl").exists():
+        available["Best Model"] = "thyroid_model.pkl"
 
+    return available
 
-def align_features(df: pd.DataFrame, feature_names: list[str]) -> pd.DataFrame:
+def load_model(model_path):
+    return joblib.load(model_path)
+
+@st.cache_data
+def load_dataset():
+    df = pd.read_csv("cleaned_dataset_Thyroid1.csv")
+    return clean_columns(df)
+
+@st.cache_data
+def load_feature_columns():
+    if Path("feature_columns.pkl").exists():
+        return joblib.load("feature_columns.pkl")
+    return None
+
+def normalize_for_model(df: pd.DataFrame) -> pd.DataFrame:
     df = clean_columns(df)
-    out = df.copy()
-    for col in feature_names:
-        if col not in out.columns:
-            out[col] = 0
-    out = out[feature_names]
-    out = out.apply(pd.to_numeric, errors="coerce").fillna(0)
-    return out
 
+    if "TSH" in df.columns and "FTI" in df.columns and "TSH_FTI_Ratio" not in df.columns:
+        df["TSH_FTI_Ratio"] = df["TSH"] / (df["FTI"].replace(0, np.nan) + 1e-3)
+        df["TSH_FTI_Ratio"] = df["TSH_FTI_Ratio"].fillna(0)
 
-def build_input_row(
-    feature_names: list[str],
-    age: int,
-    sex_val: int,
-    tsh: float,
-    fti: float,
-) -> pd.DataFrame:
-    ratio = tsh / (fti + 0.001)
-    age_group = 0 if age < 30 else (1 if age <= 60 else 2)
+    if "age" in df.columns and "Age_Group" not in df.columns:
+        df["Age_Group"] = pd.cut(
+            df["age"],
+            bins=[0, 29, 60, 120],
+            labels=[0, 1, 2],
+            include_lowest=True
+        ).astype("int64")
 
-    row = {col: 0 for col in feature_names}
-    lookup = {c.lower(): c for c in feature_names}
+    return df
 
-    def set_if_present(name: str, value):
-        key = lookup.get(name.lower())
-        if key is not None:
-            row[key] = value
+def get_preprocessed_matrix(df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
+    df = normalize_for_model(df)
+    X = df.copy()
 
-    # Strongly relevant fields
-    set_if_present("age", age)
-    set_if_present("sex", sex_val)
-    set_if_present("TSH", tsh)
-    set_if_present("FTI", fti)
-    set_if_present("TSH_FTI_Ratio", ratio)
-    set_if_present("Age_Group", age_group)
-    set_if_present("Symptom_Score", 0)
+    # Remove target if present
+    for target_like in ["binaryClass", "target", "Target", "Class", "class", "label", "Label", "Outcome", "diagnosis", "Diagnosis", "Result"]:
+        if target_like in X.columns:
+            X = X.drop(columns=[target_like])
 
-    # Measured flags if present
-    set_if_present("TSH measured", 1)
-    set_if_present("FTI measured", 1)
-    set_if_present("T3 measured", 0)
-    set_if_present("TT4 measured", 0)
-    set_if_present("T4U measured", 0)
+    # One-hot encode
+    X = pd.get_dummies(X, drop_first=False)
 
-    # Common thyroid-history flags if present
-    for col_name in [
+    # Align columns
+    for col in feature_columns:
+        if col not in X.columns:
+            X[col] = 0
+
+    X = X[feature_columns]
+    X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
+    return X
+
+def build_input_row_raw(name, age, sex, tsh, fti, dataset_cols):
+    row = {c: 0 for c in dataset_cols}
+
+    # set raw fields if present
+    if "age" in row:
+        row["age"] = age
+    if "Age" in row:
+        row["Age"] = age
+    if "sex" in row:
+        row["sex"] = 1 if sex == "Male" else 0
+    if "Sex" in row:
+        row["Sex"] = 1 if sex == "Male" else 0
+    if "TSH" in row:
+        row["TSH"] = tsh
+    if "FTI" in row:
+        row["FTI"] = fti
+
+    # common clinical flags if present
+    for c in [
         "on thyroxine", "query on thyroxine", "on antithyroid medication",
         "sick", "pregnant", "thyroid surgery", "I131 treatment",
         "query hypothyroid", "query hyperthyroid", "lithium", "goitre",
-        "tumor", "hypopituitary", "psych"
+        "tumor", "hypopituitary", "psych",
+        "TSH measured", "T3 measured", "TT4 measured", "T4U measured", "FTI measured"
     ]:
-        set_if_present(col_name, 0)
+        if c in row:
+            row[c] = 1 if c in ["TSH measured", "FTI measured"] else 0
 
     return pd.DataFrame([row])
 
+def build_featured_input(name, age, sex, tsh, fti, feature_columns, dataset_cols):
+    raw_row = build_input_row_raw(name, age, sex, tsh, fti, dataset_cols)
+    raw_row = normalize_for_model(raw_row)
+    X_input = pd.get_dummies(raw_row, drop_first=False)
 
-def create_pdf_report(name, age, sex, tsh, fti, ratio, verdict, confidence, recommendation, risk):
+    for col in feature_columns:
+        if col not in X_input.columns:
+            X_input[col] = 0
+
+    X_input = X_input[feature_columns]
+    X_input = X_input.apply(pd.to_numeric, errors="coerce").fillna(0)
+    return X_input
+
+def get_metrics_for_model(model, X_test, y_test):
+    pred = model.predict(X_test)
+    avg = "binary" if pd.Series(y_test).nunique() == 2 else "weighted"
+
+    acc = accuracy_score(y_test, pred)
+    pre = precision_score(y_test, pred, average=avg, zero_division=0)
+    rec = recall_score(y_test, pred, average=avg, zero_division=0)
+    f1 = f1_score(y_test, pred, average=avg, zero_division=0)
+    cm = confusion_matrix(y_test, pred)
+
+    return {
+        "Accuracy": acc,
+        "Precision": pre,
+        "Recall": rec,
+        "F1 Score": f1,
+        "CM": cm
+    }
+
+def doctor_recommendation(tsh, fti, ratio, verdict_text, confidence):
+    if tsh > TSH_NORMAL[1] and fti < FTI_NORMAL[0]:
+        rec = "Possible hypothyroid indication. Recommend endocrinologist consultation."
+        risk = "High"
+    elif tsh < TSH_NORMAL[0] and fti > FTI_NORMAL[1]:
+        rec = "Possible hyperthyroid indication. Recommend endocrinologist consultation."
+        risk = "High"
+    elif verdict_text == "Positive":
+        rec = "Abnormal thyroid pattern detected. Clinical review is advised to confirm the diagnosis."
+        risk = "Medium" if confidence >= 70 else "High"
+    else:
+        rec = "Hormone balance appears stable. Routine follow-up is reasonable."
+        risk = "Low" if confidence >= 80 else "Medium"
+
+    if confidence < 70 and risk == "Low":
+        risk = "Medium"
+
+    return rec, risk
+
+def confidence_explanation(tsh, fti, ratio, confidence):
+    reasons = []
+
+    if confidence < 70:
+        if TSH_NORMAL[0] <= tsh <= TSH_NORMAL[1]:
+            reasons.append("TSH is close to the normal range, so the pattern is less clear.")
+        if FTI_NORMAL[0] <= fti <= FTI_NORMAL[1]:
+            reasons.append("FTI is close to the normal range, so the model has weaker evidence.")
+        if RATIO_NORMAL[0] <= ratio <= RATIO_NORMAL[1]:
+            reasons.append("TSH/FTI ratio is near the normal band, which makes the decision less certain.")
+        if abs(tsh - TSH_NORMAL[1]) < 1 or abs(tsh - TSH_NORMAL[0]) < 1:
+            reasons.append("TSH is borderline.")
+        if abs(fti - FTI_NORMAL[0]) < 15 or abs(fti - FTI_NORMAL[1]) < 15:
+            reasons.append("FTI is borderline.")
+    elif confidence < 85:
+        reasons.append("The input shows a mixed pattern: some values are normal while others are mildly abnormal.")
+    else:
+        reasons.append("The input values form a clear pattern, so the model is confident.")
+
+    if not reasons:
+        reasons.append("The model detected a strong clinical pattern.")
+
+    return reasons
+
+def make_live_chart(tsh, fti, verdict_text=None):
+    point_color = "#94a3b8"
+    if verdict_text == "Positive":
+        point_color = "#ef4444"
+    elif verdict_text == "Negative":
+        point_color = "#22c55e"
+
+    fig = go.Figure()
+
+    fig.add_shape(
+        type="rect",
+        x0=FTI_NORMAL[0], x1=FTI_NORMAL[1],
+        y0=TSH_NORMAL[0], y1=TSH_NORMAL[1],
+        fillcolor="rgba(34,197,94,0.16)",
+        line=dict(color="rgba(34,197,94,0.55)", width=2),
+        layer="below",
+    )
+
+    fig.add_vline(x=FTI_NORMAL[0], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
+    fig.add_vline(x=FTI_NORMAL[1], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
+    fig.add_hline(y=TSH_NORMAL[0], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
+    fig.add_hline(y=TSH_NORMAL[1], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
+
+    fig.add_trace(
+        go.Scatter(
+            x=[fti],
+            y=[tsh],
+            mode="markers+text",
+            text=["Patient"],
+            textposition="top center",
+            marker=dict(size=16, color=point_color, line=dict(color="white", width=1.5)),
+            name="Patient Point",
+        )
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=460,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title="Real-time TSH vs FTI Chart",
+        xaxis_title="FTI",
+        yaxis_title="TSH",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+def build_metric_chart(metrics_df):
+    plot_df = metrics_df.reset_index().rename(columns={"index": "Model"})
+    long_df = plot_df.melt(
+        id_vars="Model",
+        value_vars=["Accuracy", "Precision", "Recall", "F1"],
+        var_name="Metric",
+        value_name="Score"
+    )
+    fig = px.bar(
+        long_df,
+        x="Model",
+        y="Score",
+        color="Metric",
+        barmode="group",
+        text_auto=".3f",
+        title="Multi-model Performance Comparison",
+    )
+    fig.update_layout(template="plotly_dark", height=480, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+def build_confusion_figure(cm, title):
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=cm,
+            x=["Predicted Negative", "Predicted Positive"],
+            y=["Actual Negative", "Actual Positive"],
+            colorscale="Blues",
+            showscale=True,
+        )
+    )
+    fig.update_layout(
+        title=title,
+        template="plotly_dark",
+        height=420,
+        margin=dict(l=10, r=10, t=45, b=10),
+    )
+    return fig
+
+def build_pie_chart(df, target_col):
+    counts = df[target_col].value_counts(dropna=False)
+    labels = [str(x) for x in counts.index]
+    values = counts.values.tolist()
+    fig = px.pie(names=labels, values=values, hole=0.42, title="Disease Distribution")
+    fig.update_layout(template="plotly_dark", height=420, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+def build_correlation_heatmap(df, exclude_col=None):
+    numeric_df = df.select_dtypes(include=[np.number]).copy()
+    if exclude_col and exclude_col in numeric_df.columns:
+        numeric_df = numeric_df.drop(columns=[exclude_col])
+    if numeric_df.shape[1] < 2:
+        return None
+    corr = numeric_df.corr(numeric_only=True)
+    fig = px.imshow(
+        corr,
+        text_auto=".2f",
+        aspect="auto",
+        color_continuous_scale="RdBu_r",
+        zmin=-1,
+        zmax=1,
+        title="Correlation Heatmap",
+    )
+    fig.update_layout(template="plotly_dark", height=650, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+def build_biomarker_trend(df):
+    age_col = detect_age_column(df)
+    if "TSH" not in df.columns and "FTI" not in df.columns:
+        return None
+
+    plot_df = df.copy()
+    if age_col and pd.api.types.is_numeric_dtype(plot_df[age_col]):
+        plot_df = plot_df.sort_values(age_col)
+        x_col = age_col
+    else:
+        plot_df = plot_df.reset_index(drop=True)
+        plot_df["sample_idx"] = plot_df.index
+        x_col = "sample_idx"
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    if "TSH" in plot_df.columns:
+        fig.add_trace(go.Scatter(x=plot_df[x_col], y=plot_df["TSH"], mode="lines", name="TSH"), secondary_y=False)
+    if "FTI" in plot_df.columns:
+        fig.add_trace(go.Scatter(x=plot_df[x_col], y=plot_df["FTI"], mode="lines", name="FTI"), secondary_y=True)
+
+    fig.update_layout(
+        template="plotly_dark",
+        title="Biomarker Trend",
+        height=480,
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    fig.update_xaxes(title_text=age_col if age_col else "Sample Index")
+    fig.update_yaxes(title_text="TSH", secondary_y=False)
+    fig.update_yaxes(title_text="FTI", secondary_y=True)
+    return fig
+
+def make_pdf_report(name, age, sex, tsh, fti, ratio, verdict, confidence, recommendation, risk, model_name, model_acc):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=12)
@@ -269,6 +495,8 @@ def create_pdf_report(name, age, sex, tsh, fti, ratio, verdict, confidence, reco
     pdf.set_font("Arial", "B", 13)
     pdf.cell(0, 8, "AI Result", ln=True)
     pdf.set_font("Arial", "", 11)
+    pdf.cell(0, 7, f"Selected Model: {model_name}", ln=True)
+    pdf.cell(0, 7, f"Model Test Accuracy: {model_acc*100:.2f}%", ln=True)
     pdf.cell(0, 7, f"Prediction: {verdict}", ln=True)
     pdf.cell(0, 7, f"Confidence: {confidence:.2f}%", ln=True)
     pdf.cell(0, 7, f"Risk Level: {risk}", ln=True)
@@ -281,283 +509,16 @@ def create_pdf_report(name, age, sex, tsh, fti, ratio, verdict, confidence, reco
 
     return pdf.output(dest="S").encode("latin-1")
 
-
-def make_live_chart(tsh, fti, verdict_text=None):
-    point_color = "#94a3b8"
-    if verdict_text == "Positive":
-        point_color = "#ef4444"
-    elif verdict_text == "Negative":
-        point_color = "#22c55e"
-
-    fig = go.Figure()
-
-    # Normal zone rectangle
-    fig.add_shape(
-        type="rect",
-        x0=FTI_NORMAL[0], x1=FTI_NORMAL[1],
-        y0=TSH_NORMAL[0], y1=TSH_NORMAL[1],
-        fillcolor="rgba(34,197,94,0.16)",
-        line=dict(color="rgba(34,197,94,0.55)", width=2),
-        layer="below",
-    )
-
-    # Reference lines
-    fig.add_vline(x=FTI_NORMAL[0], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
-    fig.add_vline(x=FTI_NORMAL[1], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
-    fig.add_hline(y=TSH_NORMAL[0], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
-    fig.add_hline(y=TSH_NORMAL[1], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
-
-    fig.add_trace(
-        go.Scatter(
-            x=[fti],
-            y=[tsh],
-            mode="markers+text",
-            text=["Patient"],
-            textposition="top center",
-            marker=dict(size=16, color=point_color, line=dict(color="white", width=1.5)),
-            name="Patient Point",
-        )
-    )
-
-    fig.update_layout(
-        template="plotly_dark",
-        height=470,
-        margin=dict(l=10, r=10, t=40, b=10),
-        title="Real-time TSH vs FTI Chart",
-        xaxis_title="FTI",
-        yaxis_title="TSH",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    return fig
-
-
-def doctor_recommendation(tsh, fti, ratio, verdict_text, confidence):
-    if tsh > TSH_NORMAL[1] and fti < FTI_NORMAL[0]:
-        rec = "Possible hypothyroid indication. Recommend endocrinologist consultation."
-        risk = "High"
-    elif tsh < TSH_NORMAL[0] and fti > FTI_NORMAL[1]:
-        rec = "Possible hyperthyroid indication. Recommend endocrinologist consultation."
-        risk = "High"
-    elif verdict_text == "Positive":
-        rec = "Abnormal thyroid pattern detected. Clinical review is advised to confirm the diagnosis."
-        risk = "Medium" if confidence >= 70 else "High"
-    else:
-        rec = "Hormone balance appears stable. Routine follow-up is reasonable."
-        risk = "Low" if confidence >= 80 else "Medium"
-
-    # Confidence-based refinement
-    if confidence < 70:
-        risk = "Medium" if risk == "Low" else risk
-
-    return rec, risk
-
-
-def confidence_explanation(tsh, fti, ratio, confidence):
-    reasons = []
-
-    tsh_normal = TSH_NORMAL[0] <= tsh <= TSH_NORMAL[1]
-    fti_normal = FTI_NORMAL[0] <= fti <= FTI_NORMAL[1]
-    ratio_normal = RATIO_NORMAL[0] <= ratio <= RATIO_NORMAL[1]
-
-    if confidence < 70:
-        if tsh_normal:
-            reasons.append("TSH is close to the normal range, so the pattern is less clear.")
-        if fti_normal:
-            reasons.append("FTI is close to the normal range, so the model has weaker evidence.")
-        if ratio_normal:
-            reasons.append("TSH/FTI ratio is near the normal band, which makes the decision less certain.")
-        if abs(tsh - TSH_NORMAL[1]) < 1 or abs(tsh - TSH_NORMAL[0]) < 1:
-            reasons.append("TSH is borderline.")
-        if abs(fti - FTI_NORMAL[0]) < 15 or abs(fti - FTI_NORMAL[1]) < 15:
-            reasons.append("FTI is borderline.")
-    elif confidence < 85:
-        reasons.append("The input shows a mixed pattern: some values are normal while others are mildly abnormal.")
-    else:
-        reasons.append("The input values form a clear pattern, so the model is confident.")
-
-    if not reasons:
-        reasons.append("The model detected a strong clinical pattern.")
-
-    return reasons
-
-
-def positive_negative_banner(verdict_text, confidence):
-    if verdict_text == "Positive":
-        st.markdown(
-            f"""
-            <div class="result-pos">
-                <h3 style="margin:0;">🚨 Positive</h3>
-                <p style="margin:0.35rem 0 0 0;">Disease pattern detected</p>
-                <p style="margin:0.35rem 0 0 0;">Confidence: <b>{confidence:.2f}%</b></p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            f"""
-            <div class="result-neg">
-                <h3 style="margin:0;">✅ Negative</h3>
-                <p style="margin:0.35rem 0 0 0;">Healthy / stable pattern</p>
-                <p style="margin:0.35rem 0 0 0;">Confidence: <b>{confidence:.2f}%</b></p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-def render_recommendation_card(recommendation, risk):
-    st.markdown(
-        f"""
-        <div class="recommendation">
-            <h4 style="margin-top:0; margin-bottom:0.3rem;">🩺 Doctor Recommendation</h4>
-            <p style="margin:0.2rem 0 0.5rem 0;">{recommendation}</p>
-            <p style="margin:0;"><b>Risk level:</b> {risk}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def build_confusion_figure(cm, title):
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=cm,
-            x=["Predicted Negative", "Predicted Positive"],
-            y=["Actual Negative", "Actual Positive"],
-            colorscale="Blues",
-            showscale=True,
-        )
-    )
-    fig.update_layout(
-        title=title,
-        template="plotly_dark",
-        height=420,
-        margin=dict(l=10, r=10, t=45, b=10),
-    )
-    return fig
-
-
-def build_metric_chart(metrics_df):
-    plot_df = metrics_df.reset_index().rename(columns={"index": "Model"})
-    long_df = plot_df.melt(id_vars="Model", value_vars=["Accuracy", "Precision", "Recall", "F1"], var_name="Metric", value_name="Score")
-    fig = px.bar(
-        long_df,
-        x="Model",
-        y="Score",
-        color="Metric",
-        barmode="group",
-        text_auto=".2f",
-        title="Multi-model Performance Comparison",
-    )
-    fig.update_layout(
-        template="plotly_dark",
-        height=470,
-        margin=dict(l=10, r=10, t=50, b=10),
-        yaxis_title="Score",
-    )
-    return fig
-
-
-def build_pie_chart(df, target_col):
-    counts = df[target_col].value_counts(dropna=False)
-    labels = [str(x) for x in counts.index]
-    values = counts.values.tolist()
-    fig = px.pie(
-        names=labels,
-        values=values,
-        hole=0.42,
-        title="Disease Distribution",
-    )
-    fig.update_layout(template="plotly_dark", height=420, margin=dict(l=10, r=10, t=50, b=10))
-    return fig
-
-
-def build_correlation_heatmap(df, exclude_col=None):
-    numeric_df = df.select_dtypes(include=[np.number]).copy()
-    if exclude_col and exclude_col in numeric_df.columns:
-        numeric_df = numeric_df.drop(columns=[exclude_col])
-    if numeric_df.shape[1] < 2:
-        return None
-    corr = numeric_df.corr(numeric_only=True)
-    fig = px.imshow(
-        corr,
-        text_auto=".2f",
-        aspect="auto",
-        color_continuous_scale="RdBu_r",
-        zmin=-1,
-        zmax=1,
-        title="Correlation Heatmap",
-    )
-    fig.update_layout(template="plotly_dark", height=650, margin=dict(l=10, r=10, t=50, b=10))
-    return fig
-
-
-def build_biomarker_trend(df):
-    age_col = detect_age_column(df)
-    columns = [c for c in ["TSH", "FTI"] if c in df.columns]
-
-    if not columns:
-        return None
-
-    plot_df = df.copy()
-    if age_col and pd.api.types.is_numeric_dtype(plot_df[age_col]):
-        plot_df = plot_df.sort_values(age_col)
-        x_col = age_col
-    else:
-        plot_df = plot_df.reset_index(drop=True)
-        x_col = plot_df.index
-
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-    if "TSH" in plot_df.columns:
-        fig.add_trace(go.Scatter(x=plot_df[x_col], y=plot_df["TSH"], mode="lines", name="TSH"), secondary_y=False)
-    if "FTI" in plot_df.columns:
-        fig.add_trace(go.Scatter(x=plot_df[x_col], y=plot_df["FTI"], mode="lines", name="FTI"), secondary_y=True)
-
-    fig.update_layout(
-        template="plotly_dark",
-        title="Biomarker Trend",
-        height=480,
-        margin=dict(l=10, r=10, t=50, b=10),
-    )
-    fig.update_xaxes(title_text=age_col if age_col else "Sample Index")
-    fig.update_yaxes(title_text="TSH", secondary_y=False)
-    fig.update_yaxes(title_text="FTI", secondary_y=True)
-    return fig
-
-
-def get_top_feature_importance(explainer, df_train_features, feature_names, top_n=15):
-    try:
-        sample_n = min(120, len(df_train_features))
-        sample = df_train_features.sample(sample_n, random_state=42) if len(df_train_features) > sample_n else df_train_features.copy()
-        shap_values = explainer(sample)
-        vals = np.abs(shap_values.values).mean(axis=0)
-        imp_df = pd.DataFrame({"Feature": feature_names, "Importance": vals})
-        imp_df = imp_df.sort_values("Importance", ascending=False).head(top_n)
-        return imp_df
-    except Exception:
-        return None
-
-
-def build_bar_chart_from_df(df_plot, x, y, title):
-    fig = px.bar(df_plot, x=x, y=y, text_auto=".3f", title=title)
-    fig.update_layout(template="plotly_dark", height=470, margin=dict(l=10, r=10, t=50, b=10))
-    return fig
-
 # =========================================================
-# LOAD USER FILE
+# Login
 # =========================================================
 try:
     with open("users.json") as f:
         users = json.load(f)
 except Exception as e:
-    st.error(f"users.json ফাইলটি পাওয়া যায়নি. Error: {e}")
+    st.error(f"users.json file not found. Error: {e}")
     st.stop()
 
-# =========================================================
-# LOGIN
-# =========================================================
 if "login" not in st.session_state:
     st.session_state.login = False
 
@@ -566,7 +527,9 @@ def login_ui():
         """
         <div class="top-banner">
             <h1 style="margin:0;">🧠 Explainable Thyroid AI</h1>
-            <p style="margin:0.35rem 0 0 0;" class="small-muted">Secure portal for thesis demonstration and clinical decision support</p>
+            <p style="margin:0.35rem 0 0 0;" class="small-muted">
+                Secure portal for thesis demonstration and clinical decision support
+            </p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -587,138 +550,111 @@ if not st.session_state.login:
     st.stop()
 
 # =========================================================
-# LOAD RESOURCES
+# Load data and models
 # =========================================================
-@st.cache_resource
-def load_core_model():
-    model = joblib.load("thyroid_model.pkl")
-    try:
-        explainer = shap.TreeExplainer(model)
-    except Exception:
-        explainer = shap.Explainer(model)
-    return model, explainer
-
-@st.cache_data
-def load_dataset():
-    df = pd.read_csv("cleaned_dataset_Thyroid1.csv")
-    df = clean_columns(df)
-    return df
-
-xgb_model, xgb_explainer = load_core_model()
 df_raw = load_dataset()
+df_raw = normalize_for_model(df_raw)
 
 target_col = detect_target_column(df_raw)
 if target_col is None:
-    st.error(
-        "Dataset-এ target column পাওয়া যায়নি। "
-        "Target column-এর নাম binaryClass / Class / target জাতীয় কিছু হতে হবে।"
-    )
+    st.error("No target column found in the dataset. Use binaryClass / Class / target-like column.")
     st.stop()
 
-feature_names = safe_feature_list(xgb_model, df_raw, target_col)
-df_features = align_features(df_raw, feature_names)
-y_all = df_raw[target_col]
+feature_columns = load_feature_columns()
+if feature_columns is None:
+    temp_df = df_raw.copy()
+    temp_df = normalize_for_model(temp_df)
+    temp_df = temp_df.drop(columns=[target_col])
+    temp_df = pd.get_dummies(temp_df, drop_first=False)
+    feature_columns = temp_df.columns.tolist()
 
-# =========================================================
-# TRAIN/TEST SPLIT FOR REAL METRICS + COMPARISON MODELS
-# =========================================================
-@st.cache_resource
-def build_comparison_models(X, y):
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y if y.nunique() == 2 else None,
-    )
+X_all = get_preprocessed_matrix(df_raw, feature_columns)
+y_all = df_raw[target_col].copy()
 
-    rf = RandomForestClassifier(
-        n_estimators=300,
-        random_state=42,
-        class_weight="balanced",
-        n_jobs=-1,
-    )
-    lr = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            ("lr", LogisticRegression(max_iter=2000, class_weight="balanced")),
-        ]
-    )
+# Normalize y to 0/1 if needed
+if y_all.dtype == "O":
+    s = y_all.astype(str).str.strip().str.lower()
 
-    rf.fit(X_train, y_train)
-    lr.fit(X_train, y_train)
+    def map_target(v):
+        v = str(v).strip().lower()
+        if v in ["1", "true", "yes", "positive", "disease", "diseased", "abnormal", "hyper", "hypo", "present"]:
+            return 1
+        if v in ["0", "false", "no", "negative", "normal", "healthy", "ok", "absent"]:
+            return 0
+        if "positive" in v or "disease" in v or "abnormal" in v:
+            return 1
+        if "negative" in v or "normal" in v or "healthy" in v:
+            return 0
+        return 1 if v not in ["0", "false", "no"] else 0
 
-    return X_train, X_test, y_train, y_test, rf, lr
+    y_all = s.map(map_target).astype(int)
+else:
+    y_all = pd.to_numeric(y_all, errors="coerce").fillna(0).astype(int)
 
-X_train, X_test, y_train, y_test, rf_model, lr_model = build_comparison_models(df_features, y_all)
+X_train, X_test, y_train, y_test = train_test_split(
+    X_all,
+    y_all,
+    test_size=0.2,
+    random_state=42,
+    stratify=y_all if y_all.nunique() == 2 else None,
+)
 
-def calc_scores(model, X_test, y_test):
-    pred = model.predict(X_test)
-    avg = "binary" if pd.Series(y_test).nunique() == 2 and set(pd.Series(y_test).dropna().astype(str).unique()) <= {"0", "1"} else "weighted"
+# Load models
+available_model_files = get_available_model_files()
+if not available_model_files:
+    st.error("No model files found. Save xgboost_model.pkl, random_forest_model.pkl, logistic_regression_model.pkl, decision_tree_model.pkl, svm_model.pkl.")
+    st.stop()
 
-    scores = {
-        "Accuracy": accuracy_score(y_test, pred),
-        "Precision": precision_score(y_test, pred, average=avg, zero_division=0),
-        "Recall": recall_score(y_test, pred, average=avg, zero_division=0),
-        "F1": f1_score(y_test, pred, average=avg, zero_division=0),
-        "CM": confusion_matrix(y_test, pred),
-    }
-    return scores
+models = {}
+for name, path in available_model_files.items():
+    try:
+        models[name] = load_model(path)
+    except Exception as e:
+        st.warning(f"Could not load {name}: {e}")
 
-xgb_scores = calc_scores(xgb_model, X_test, y_test)
-rf_scores = calc_scores(rf_model, X_test, y_test)
-lr_scores = calc_scores(lr_model, X_test, y_test)
+if not models:
+    st.error("No model could be loaded.")
+    st.stop()
+
+# Evaluate models
+model_scores = {}
+for name, model in models.items():
+    try:
+        model_scores[name] = get_metrics_for_model(model, X_test, y_test)
+    except Exception as e:
+        st.warning(f"Could not evaluate {name}: {e}")
 
 metrics_df = pd.DataFrame(
     {
-        "XGBoost": {
-            "Accuracy": xgb_scores["Accuracy"],
-            "Precision": xgb_scores["Precision"],
-            "Recall": xgb_scores["Recall"],
-            "F1": xgb_scores["F1"],
-        },
-        "Random Forest": {
-            "Accuracy": rf_scores["Accuracy"],
-            "Precision": rf_scores["Precision"],
-            "Recall": rf_scores["Recall"],
-            "F1": rf_scores["F1"],
-        },
-        "Logistic Regression": {
-            "Accuracy": lr_scores["Accuracy"],
-            "Precision": lr_scores["Precision"],
-            "Recall": lr_scores["Recall"],
-            "F1": lr_scores["F1"],
-        },
+        name: {
+            "Accuracy": vals["Accuracy"],
+            "Precision": vals["Precision"],
+            "Recall": vals["Recall"],
+            "F1": vals["F1 Score"],
+        }
+        for name, vals in model_scores.items()
     }
 ).T
 
 best_model_name = metrics_df["Accuracy"].idxmax()
-best_model = {
-    "XGBoost": xgb_model,
-    "Random Forest": rf_model,
-    "Logistic Regression": lr_model,
-}[best_model_name]
-
-best_cm = {
-    "XGBoost": xgb_scores["CM"],
-    "Random Forest": rf_scores["CM"],
-    "Logistic Regression": lr_scores["CM"],
-}[best_model_name]
+best_model = models[best_model_name]
+best_metrics = model_scores[best_model_name]
+best_cm = best_metrics["CM"]
 
 # =========================================================
-# SIDEBAR
+# Model selector and explainers
 # =========================================================
 with st.sidebar:
     st.markdown("## 🧠 ThyroPredict AI")
     st.caption("Explainable clinical dashboard")
 
-    st.markdown("### 📊 Best Model")
-    st.success(best_model_name)
+    model_choice = st.selectbox("Active Model", list(models.keys()), index=list(models.keys()).index(best_model_name))
+    selected_model = models[model_choice]
+    selected_metrics = model_scores[model_choice]
 
     st.markdown("### 📈 Test Accuracy")
-    st.metric("XGBoost", f"{xgb_scores['Accuracy']*100:.2f}%")
-    st.metric("Random Forest", f"{rf_scores['Accuracy']*100:.2f}%")
-    st.metric("Logistic Regression", f"{lr_scores['Accuracy']*100:.2f}%")
+    for name in metrics_df.index:
+        st.metric(name, f"{metrics_df.loc[name, 'Accuracy']*100:.2f}%")
 
     st.markdown("### 🧪 Normal Reference Ranges")
     st.info(
@@ -734,8 +670,23 @@ with st.sidebar:
     st.write(f"Columns: **{len(df_raw.columns):,}**")
     st.write(f"Target: **{target_col}**")
 
+def get_selected_explainer(model_name, model):
+    try:
+        if model_name in ["XGBoost", "Random Forest", "Decision Tree"]:
+            return shap.TreeExplainer(model)
+        elif model_name == "Logistic Regression":
+            background = X_train.sample(min(100, len(X_train)), random_state=42)
+            return shap.LinearExplainer(model, background, feature_perturbation="interventional")
+        else:
+            background = X_train.sample(min(50, len(X_train)), random_state=42)
+            return shap.Explainer(model.predict_proba, background)
+    except Exception:
+        return None
+
+selected_explainer = get_selected_explainer(model_choice, selected_model)
+
 # =========================================================
-# HEADER
+# Header
 # =========================================================
 st.markdown(
     """
@@ -750,12 +701,12 @@ st.markdown(
 )
 
 # =========================================================
-# TABS
+# Tabs
 # =========================================================
-tab1, tab2, tab3, tab4 = st.tabs(["🩺 Prediction", "📈 Model Comparison", "🌍 Analytics", "📂 Batch Prediction"])
+tab1, tab2, tab3, tab4 = st.tabs(["🩺 Prediction", "📊 Model Comparison", "🌍 Analytics", "📂 Batch Prediction"])
 
 # =========================================================
-# TAB 1: PREDICTION
+# TAB 1: Prediction
 # =========================================================
 with tab1:
     st.markdown("### 📋 Patient Input")
@@ -766,7 +717,6 @@ with tab1:
         patient_name = st.text_input("Patient Name", "Patient_01")
         age = st.slider("Age", 1, 100, 30)
         sex = st.selectbox("Sex", ["Female", "Male"])
-        sex_val = 1 if sex == "Male" else 0
 
     with c2:
         tsh = st.number_input("TSH", value=6.0, min_value=0.0, step=0.1)
@@ -775,24 +725,31 @@ with tab1:
     with c3:
         ratio = tsh / (fti + 0.001)
         st.metric("TSH/FTI Ratio", f"{ratio:.5f}")
-        st.metric("Age Group", "Youth" if age < 30 else ("Adult" if age <= 60 else "Senior"))
-        st.caption("Move the inputs to update the live chart instantly.")
+        st.metric("Selected Model", model_choice)
+        st.metric("Best Model", best_model_name)
 
-    # Live chart updates with inputs
     st.markdown("### 📊 Live TSH vs FTI Chart")
     live_fig = make_live_chart(tsh, fti, None)
     st.plotly_chart(live_fig, use_container_width=True)
 
     if st.button("🚀 Run Diagnosis", type="primary", use_container_width=True):
         with st.spinner("Analyzing patient data..."):
-            input_df = build_input_row(feature_names, age, sex_val, tsh, fti)
+            input_df = build_featured_input(
+                patient_name,
+                age,
+                sex,
+                tsh,
+                fti,
+                feature_columns,
+                df_raw.columns.tolist()
+            )
 
-            pred_value = best_model.predict(input_df)[0]
+            pred_value = selected_model.predict(input_df)[0]
             pred_text = label_to_text(pred_value)
 
-            if hasattr(best_model, "predict_proba"):
-                proba = best_model.predict_proba(input_df)[0]
-                classes = list(best_model.classes_) if hasattr(best_model, "classes_") else None
+            if hasattr(selected_model, "predict_proba"):
+                proba = selected_model.predict_proba(input_df)[0]
+                classes = list(selected_model.classes_) if hasattr(selected_model, "classes_") else None
                 if classes is not None and pred_value in classes:
                     confidence = float(proba[classes.index(pred_value)]) * 100
                 else:
@@ -800,7 +757,7 @@ with tab1:
             else:
                 confidence = 100.0 if pred_text == "Positive" else 0.0
 
-            rec, risk = doctor_recommendation(tsh, fti, ratio, pred_text, confidence)
+            recommendation, risk = doctor_recommendation(tsh, fti, ratio, pred_text, confidence)
             reasons = confidence_explanation(tsh, fti, ratio, confidence)
 
         st.markdown("---")
@@ -808,7 +765,28 @@ with tab1:
         res_col1, res_col2 = st.columns([1.2, 1.0])
 
         with res_col1:
-            positive_negative_banner(pred_text, confidence)
+            if pred_text == "Positive":
+                st.markdown(
+                    f"""
+                    <div class="result-pos">
+                        <h3 style="margin:0;">🚨 Positive</h3>
+                        <p style="margin:0.35rem 0 0 0;">Disease pattern detected</p>
+                        <p style="margin:0.35rem 0 0 0;">Confidence: <b>{confidence:.2f}%</b></p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"""
+                    <div class="result-neg">
+                        <h3 style="margin:0;">✅ Negative</h3>
+                        <p style="margin:0.35rem 0 0 0;">Healthy / stable pattern</p>
+                        <p style="margin:0.35rem 0 0 0;">Confidence: <b>{confidence:.2f}%</b></p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
             st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
             st.markdown("#### 🧠 Clinical Interpretation")
@@ -830,11 +808,20 @@ with tab1:
             else:
                 st.write("• FTI is within the normal range.")
 
-            st.write(f"• TSH/FTI ratio helps the model capture hormone relationship and imbalance.")
+            st.write("• TSH/FTI ratio helps the model capture hormone relationship and imbalance.")
             st.markdown("</div>", unsafe_allow_html=True)
 
         with res_col2:
-            render_recommendation_card(rec, risk)
+            st.markdown(
+                f"""
+                <div class="recommendation">
+                    <h4 style="margin-top:0; margin-bottom:0.3rem;">🩺 Doctor Recommendation</h4>
+                    <p style="margin:0.2rem 0 0.5rem 0;">{recommendation}</p>
+                    <p style="margin:0;"><b>Risk level:</b> {risk}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
             st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
             st.markdown("#### 📊 Confidence Meter")
@@ -850,26 +837,27 @@ with tab1:
             st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("### 🔍 Why confidence is high / low")
-        if confidence < 70:
-            st.warning("The model is less certain because the input is close to normal reference values or shows a mixed pattern.")
         for r in reasons:
             st.write("•", r)
 
         st.markdown("### 🧠 Explainable AI (SHAP)")
-        try:
-            shap_values = xgb_explainer(input_df)
-            fig, ax = plt.subplots(figsize=(11, 5))
-            shap.plots.waterfall(shap_values[0], show=False)
-            st.pyplot(fig, use_container_width=True, clear_figure=True)
-        except Exception as e:
-            st.info(f"SHAP waterfall could not be rendered in this run. ({e})")
+        if selected_explainer is not None:
+            try:
+                shap_values = selected_explainer(input_df)
+                fig, ax = plt.subplots(figsize=(11, 5))
+                shap.plots.waterfall(shap_values[0], show=False)
+                st.pyplot(fig, use_container_width=True, clear_figure=True)
+            except Exception as e:
+                st.info(f"SHAP waterfall could not be rendered in this run. ({e})")
+        else:
+            st.info("Selected model does not support SHAP in this runtime.")
 
         st.markdown("### 📈 Patient Live Chart")
         result_chart = make_live_chart(tsh, fti, pred_text)
         st.plotly_chart(result_chart, use_container_width=True)
 
         st.markdown("### 📄 Export Report")
-        pdf_bytes = create_pdf_report(
+        pdf_bytes = make_pdf_report(
             patient_name,
             age,
             sex,
@@ -878,8 +866,10 @@ with tab1:
             ratio,
             pred_text,
             confidence,
-            rec,
+            recommendation,
             risk,
+            model_choice,
+            metrics_df.loc[model_choice, "Accuracy"],
         )
         st.download_button(
             "Download PDF Report",
@@ -890,7 +880,7 @@ with tab1:
         )
 
 # =========================================================
-# TAB 2: MODEL COMPARISON
+# TAB 2: Model Comparison
 # =========================================================
 with tab2:
     st.markdown("### 📊 Multi-model Performance")
@@ -908,12 +898,16 @@ with tab2:
     show_df = (metrics_df * 100).round(2)
     st.dataframe(show_df, use_container_width=True)
 
-    st.markdown("### 📉 Confusion Matrix of Best Model")
+    st.markdown("### 📉 Confusion Matrix of Selected Model")
+    cm_fig = build_confusion_figure(selected_metrics["CM"], f"{model_choice} Confusion Matrix")
+    st.plotly_chart(cm_fig, use_container_width=True)
+
+    st.markdown("### 🏆 Best Model Confusion Matrix")
     best_cm_fig = build_confusion_figure(best_cm, f"{best_model_name} Confusion Matrix")
     st.plotly_chart(best_cm_fig, use_container_width=True)
 
 # =========================================================
-# TAB 3: ANALYTICS
+# TAB 3: Analytics
 # =========================================================
 with tab3:
     st.markdown("### 🧾 Dataset Overview")
@@ -924,7 +918,7 @@ with tab3:
     with o2:
         st.metric("Columns", f"{len(df_raw.columns):,}")
     with o3:
-        st.metric("Features used", f"{len(feature_names):,}")
+        st.metric("Features used", f"{len(feature_columns):,}")
     with o4:
         missing_total = int(df_raw.isna().sum().sum())
         st.metric("Missing values", f"{missing_total:,}")
@@ -948,18 +942,34 @@ with tab3:
         st.info("Biomarker trend graph could not be generated.")
 
     st.markdown("### 🌍 Global Explainability")
-    try:
-        top_imp = get_top_feature_importance(xgb_explainer, df_features, feature_names, top_n=15)
-        if top_imp is not None and not top_imp.empty:
-            imp_fig = build_bar_chart_from_df(top_imp.sort_values("Importance", ascending=True), "Importance", "Feature", "Top SHAP Feature Importance")
-            st.plotly_chart(imp_fig, use_container_width=True)
-        else:
-            st.info("Could not compute global feature importance in this session.")
-    except Exception as e:
-        st.info(f"Global explainability unavailable. ({e})")
+    if selected_explainer is not None:
+        try:
+            sample_n = min(120, len(X_train))
+            background = X_train.sample(sample_n, random_state=42) if len(X_train) > sample_n else X_train.copy()
+            shap_values = selected_explainer(background)
+
+            try:
+                vals = np.abs(shap_values.values).mean(axis=0)
+                imp_df = pd.DataFrame({"Feature": background.columns, "Importance": vals})
+                imp_df = imp_df.sort_values("Importance", ascending=False).head(15)
+                imp_fig = px.bar(
+                    imp_df.sort_values("Importance", ascending=True),
+                    x="Importance",
+                    y="Feature",
+                    orientation="h",
+                    title="Top SHAP Feature Importance"
+                )
+                imp_fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10, r=10, t=50, b=10))
+                st.plotly_chart(imp_fig, use_container_width=True)
+            except Exception:
+                st.info("Could not render global feature importance chart.")
+        except Exception as e:
+            st.info(f"Global explainability unavailable. ({e})")
+    else:
+        st.info("Global explainability is unavailable for the selected model.")
 
 # =========================================================
-# TAB 4: BATCH PREDICTION
+# TAB 4: Batch Prediction
 # =========================================================
 with tab4:
     st.markdown("### 📂 Upload CSV for Batch Prediction")
@@ -974,17 +984,17 @@ with tab4:
 
         if st.button("Run Batch Prediction", use_container_width=True):
             with st.spinner("Running batch prediction..."):
-                batch_aligned = align_features(batch_df, feature_names)
+                batch_X = get_preprocessed_matrix(batch_df, feature_columns)
 
-                preds = best_model.predict(batch_aligned)
+                preds = selected_model.predict(batch_X)
                 pred_texts = [label_to_text(p) for p in preds]
 
                 batch_result = batch_df.copy()
                 batch_result["AI_Result"] = pred_texts
 
-                if hasattr(best_model, "predict_proba"):
-                    probs = best_model.predict_proba(batch_aligned)
-                    classes = list(best_model.classes_) if hasattr(best_model, "classes_") else None
+                if hasattr(selected_model, "predict_proba"):
+                    probs = selected_model.predict_proba(batch_X)
+                    classes = list(selected_model.classes_) if hasattr(selected_model, "classes_") else None
                     confs = []
                     for i, p in enumerate(preds):
                         if classes is not None and p in classes:
@@ -1007,7 +1017,7 @@ with tab4:
         st.info("Upload a CSV file to run batch prediction.")
 
 # =========================================================
-# FOOTER
+# Footer
 # =========================================================
 st.markdown("---")
 st.markdown(
