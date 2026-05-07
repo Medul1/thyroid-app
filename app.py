@@ -11,12 +11,29 @@ import json
 from datetime import datetime
 from fpdf import FPDF
 from pathlib import Path
+import warnings
 
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
+    roc_curve,
+    auc
+)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+
+warnings.filterwarnings("ignore")
 
 # =========================================================
-# Page config
+# PAGE CONFIG
 # =========================================================
 st.set_page_config(
     page_title="Explainable Thyroid AI",
@@ -26,7 +43,7 @@ st.set_page_config(
 )
 
 # =========================================================
-# UI style
+# GLOBAL STYLE
 # =========================================================
 st.markdown(
     """
@@ -108,21 +125,21 @@ st.markdown(
 )
 
 # =========================================================
-# Clinical ranges
+# CLINICAL RANGES
 # =========================================================
 TSH_NORMAL = (0.4, 4.0)
 FTI_NORMAL = (60.0, 160.0)
 RATIO_NORMAL = (0.003, 0.067)
 
 # =========================================================
-# Helpers
+# HELPER FUNCTIONS
 # =========================================================
-def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+def clean_columns(df):
     df = df.copy()
     df.columns = df.columns.astype(str).str.strip()
     return df
 
-def detect_target_column(df: pd.DataFrame) -> str | None:
+def detect_target_column(df):
     candidates = [
         "binaryClass", "target", "Target", "Class", "class",
         "label", "Label", "Outcome", "diagnosis", "Diagnosis", "Result"
@@ -132,20 +149,58 @@ def detect_target_column(df: pd.DataFrame) -> str | None:
             return c
     return None
 
-def detect_age_column(df: pd.DataFrame) -> str | None:
-    for c in df.columns:
-        if c.lower() == "age":
-            return c
-    return None
+def normalize_target(series):
+    if series.dtype == "O":
+        s = series.astype(str).str.strip().str.lower()
 
-def label_to_text(value) -> str:
-    try:
-        return "Positive" if int(value) == 1 else "Negative"
-    except Exception:
-        s = str(value).strip().lower()
-        if s in ["positive", "disease", "diseased", "abnormal", "hyper", "hypo", "yes"]:
-            return "Positive"
-        return "Negative"
+        def map_target(v):
+            v = str(v).strip().lower()
+            if v in ["1", "true", "yes", "positive", "disease", "diseased", "abnormal", "hyper", "hypo", "present"]:
+                return 1
+            if v in ["0", "false", "no", "negative", "normal", "healthy", "ok", "absent"]:
+                return 0
+            if "positive" in v or "disease" in v or "abnormal" in v:
+                return 1
+            if "negative" in v or "normal" in v or "healthy" in v:
+                return 0
+            return 1 if v not in ["0", "false", "no"] else 0
+
+        return s.map(map_target).astype(int)
+
+    return pd.to_numeric(series, errors="coerce").fillna(0).astype(int)
+
+def normalize_for_model(df):
+    df = clean_columns(df)
+
+    if "TSH" in df.columns and "FTI" in df.columns and "TSH_FTI_Ratio" not in df.columns:
+        df["TSH_FTI_Ratio"] = df["TSH"] / (df["FTI"].replace(0, np.nan) + 0.001)
+        df["TSH_FTI_Ratio"] = df["TSH_FTI_Ratio"].fillna(0)
+
+    if "age" in df.columns and "Age_Group" not in df.columns:
+        try:
+            df["Age_Group"] = pd.cut(
+                pd.to_numeric(df["age"], errors="coerce").fillna(0),
+                bins=[0, 29, 60, 120],
+                labels=[0, 1, 2],
+                include_lowest=True
+            ).astype("int64")
+        except Exception:
+            df["Age_Group"] = 0
+
+    if "Symptom_Score" not in df.columns:
+        symptom_cols = [
+            "on thyroxine", "query on thyroxine", "on antithyroid medication",
+            "sick", "pregnant", "thyroid surgery", "I131 treatment",
+            "query hypothyroid", "query hyperthyroid", "lithium", "goitre",
+            "tumor", "hypopituitary", "psych"
+        ]
+        existing = [c for c in symptom_cols if c in df.columns]
+        if existing:
+            df["Symptom_Score"] = df[existing].sum(axis=1)
+        else:
+            df["Symptom_Score"] = 0
+
+    return df
 
 def get_available_model_files():
     model_files = {
@@ -160,124 +215,108 @@ def get_available_model_files():
         if Path(file).exists():
             available[name] = file
 
-    # fallback to old single-model file
     if not available and Path("thyroid_model.pkl").exists():
         available["Best Model"] = "thyroid_model.pkl"
 
     return available
 
-def load_model(model_path):
-    return joblib.load(model_path)
+@st.cache_resource
+def load_model_file(path):
+    return joblib.load(path)
 
 @st.cache_data
 def load_dataset():
     df = pd.read_csv("cleaned_dataset_Thyroid1.csv")
     return clean_columns(df)
 
-@st.cache_data
-def load_feature_columns():
-    if Path("feature_columns.pkl").exists():
-        return joblib.load("feature_columns.pkl")
-    return None
-
-def normalize_for_model(df: pd.DataFrame) -> pd.DataFrame:
+def align_features(df, feature_columns):
     df = clean_columns(df)
-
-    if "TSH" in df.columns and "FTI" in df.columns and "TSH_FTI_Ratio" not in df.columns:
-        df["TSH_FTI_Ratio"] = df["TSH"] / (df["FTI"].replace(0, np.nan) + 1e-3)
-        df["TSH_FTI_Ratio"] = df["TSH_FTI_Ratio"].fillna(0)
-
-    if "age" in df.columns and "Age_Group" not in df.columns:
-        df["Age_Group"] = pd.cut(
-            df["age"],
-            bins=[0, 29, 60, 120],
-            labels=[0, 1, 2],
-            include_lowest=True
-        ).astype("int64")
-
-    return df
-
-def get_preprocessed_matrix(df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
-    df = normalize_for_model(df)
-    X = df.copy()
-
-    # Remove target if present
-    for target_like in ["binaryClass", "target", "Target", "Class", "class", "label", "Label", "Outcome", "diagnosis", "Diagnosis", "Result"]:
-        if target_like in X.columns:
-            X = X.drop(columns=[target_like])
-
-    # One-hot encode
-    X = pd.get_dummies(X, drop_first=False)
-
-    # Align columns
+    out = df.copy()
     for col in feature_columns:
-        if col not in X.columns:
-            X[col] = 0
+        if col not in out.columns:
+            out[col] = 0
+    out = out[feature_columns]
+    out = out.apply(pd.to_numeric, errors="coerce").fillna(0)
+    return out
 
-    X = X[feature_columns]
-    X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
-    return X
+def build_default_raw_row(template_df):
+    row = {}
+    for col in template_df.columns:
+        series = template_df[col]
+        if pd.api.types.is_numeric_dtype(series):
+            vals = pd.to_numeric(series, errors="coerce").dropna()
+            row[col] = float(vals.median()) if len(vals) else 0.0
+        else:
+            vals = series.astype(str).dropna()
+            mode = vals.mode(dropna=True)
+            row[col] = mode.iloc[0] if len(mode) else ""
+    return row
 
-def build_input_row_raw(name, age, sex, tsh, fti, dataset_cols):
-    row = {c: 0 for c in dataset_cols}
+def build_patient_raw_input(template_df, age, sex, tsh, fti):
+    row = build_default_raw_row(template_df)
 
-    # set raw fields if present
     if "age" in row:
         row["age"] = age
     if "Age" in row:
         row["Age"] = age
+
     if "sex" in row:
-        row["sex"] = 1 if sex == "Male" else 0
+        if pd.api.types.is_numeric_dtype(template_df["sex"]):
+            row["sex"] = 1 if sex == "Male" else 0
+        else:
+            row["sex"] = sex
     if "Sex" in row:
-        row["Sex"] = 1 if sex == "Male" else 0
+        if pd.api.types.is_numeric_dtype(template_df["Sex"]):
+            row["Sex"] = 1 if sex == "Male" else 0
+        else:
+            row["Sex"] = sex
+
     if "TSH" in row:
         row["TSH"] = tsh
     if "FTI" in row:
         row["FTI"] = fti
+    if "TSH_FTI_Ratio" in row:
+        row["TSH_FTI_Ratio"] = tsh / (fti + 0.001)
 
-    # common clinical flags if present
-    for c in [
-        "on thyroxine", "query on thyroxine", "on antithyroid medication",
-        "sick", "pregnant", "thyroid surgery", "I131 treatment",
-        "query hypothyroid", "query hyperthyroid", "lithium", "goitre",
-        "tumor", "hypopituitary", "psych",
-        "TSH measured", "T3 measured", "TT4 measured", "T4U measured", "FTI measured"
-    ]:
-        if c in row:
-            row[c] = 1 if c in ["TSH measured", "FTI measured"] else 0
+    if "Age_Group" in row:
+        if age < 30:
+            row["Age_Group"] = 0
+        elif age <= 60:
+            row["Age_Group"] = 1
+        else:
+            row["Age_Group"] = 2
+
+    if "Symptom_Score" in row:
+        row["Symptom_Score"] = 0
+
+    for measured in ["TSH measured", "FTI measured", "T3 measured", "TT4 measured", "T4U measured"]:
+        if measured in row:
+            row[measured] = 1 if measured in ["TSH measured", "FTI measured"] else 0
 
     return pd.DataFrame([row])
 
-def build_featured_input(name, age, sex, tsh, fti, feature_columns, dataset_cols):
-    raw_row = build_input_row_raw(name, age, sex, tsh, fti, dataset_cols)
-    raw_row = normalize_for_model(raw_row)
-    X_input = pd.get_dummies(raw_row, drop_first=False)
+def prepare_input_features(patient_df, feature_columns):
+    patient_df = normalize_for_model(patient_df)
+    patient_df = pd.get_dummies(patient_df, drop_first=False)
+    patient_df = align_features(patient_df, feature_columns)
+    return patient_df
 
-    for col in feature_columns:
-        if col not in X_input.columns:
-            X_input[col] = 0
+def choose_confidence(pred_class, proba, classes):
+    if proba is None:
+        return 100.0
+    if classes is not None and pred_class in classes:
+        idx = list(classes).index(pred_class)
+        return float(proba[idx]) * 100
+    return float(np.max(proba)) * 100
 
-    X_input = X_input[feature_columns]
-    X_input = X_input.apply(pd.to_numeric, errors="coerce").fillna(0)
-    return X_input
-
-def get_metrics_for_model(model, X_test, y_test):
-    pred = model.predict(X_test)
-    avg = "binary" if pd.Series(y_test).nunique() == 2 else "weighted"
-
-    acc = accuracy_score(y_test, pred)
-    pre = precision_score(y_test, pred, average=avg, zero_division=0)
-    rec = recall_score(y_test, pred, average=avg, zero_division=0)
-    f1 = f1_score(y_test, pred, average=avg, zero_division=0)
-    cm = confusion_matrix(y_test, pred)
-
-    return {
-        "Accuracy": acc,
-        "Precision": pre,
-        "Recall": rec,
-        "F1 Score": f1,
-        "CM": cm
-    }
+def label_to_text(value):
+    try:
+        return "Positive" if int(value) == 1 else "Negative"
+    except Exception:
+        s = str(value).strip().lower()
+        if s in ["positive", "disease", "diseased", "abnormal", "hyper", "hypo", "yes"]:
+            return "Positive"
+        return "Negative"
 
 def doctor_recommendation(tsh, fti, ratio, verdict_text, confidence):
     if tsh > TSH_NORMAL[1] and fti < FTI_NORMAL[0]:
@@ -434,7 +473,12 @@ def build_correlation_heatmap(df, exclude_col=None):
     return fig
 
 def build_biomarker_trend(df):
-    age_col = detect_age_column(df)
+    age_col = None
+    for c in df.columns:
+        if c.lower() == "age":
+            age_col = c
+            break
+
     if "TSH" not in df.columns and "FTI" not in df.columns:
         return None
 
@@ -509,8 +553,24 @@ def make_pdf_report(name, age, sex, tsh, fti, ratio, verdict, confidence, recomm
 
     return pdf.output(dest="S").encode("latin-1")
 
+def get_shap_explainer(model_name, model):
+    try:
+        if model_name in ["XGBoost", "Random Forest", "Decision Tree", "Best Model"]:
+            return shap.TreeExplainer(model)
+        return None
+    except Exception:
+        return None
+
+def get_model_prob_and_confidence(model, input_df, pred_value):
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(input_df)[0]
+        classes = list(model.classes_) if hasattr(model, "classes_") else None
+        confidence = choose_confidence(pred_value, proba, classes)
+        return proba, classes, confidence
+    return None, None, 100.0
+
 # =========================================================
-# Login
+# LOGIN
 # =========================================================
 try:
     with open("users.json") as f:
@@ -550,47 +610,32 @@ if not st.session_state.login:
     st.stop()
 
 # =========================================================
-# Load data and models
+# LOAD DATASET
 # =========================================================
 df_raw = load_dataset()
-df_raw = normalize_for_model(df_raw)
-
 target_col = detect_target_column(df_raw)
 if target_col is None:
     st.error("No target column found in the dataset. Use binaryClass / Class / target-like column.")
     st.stop()
 
-feature_columns = load_feature_columns()
-if feature_columns is None:
-    temp_df = df_raw.copy()
-    temp_df = normalize_for_model(temp_df)
-    temp_df = temp_df.drop(columns=[target_col])
-    temp_df = pd.get_dummies(temp_df, drop_first=False)
-    feature_columns = temp_df.columns.tolist()
+y_all = normalize_target(df_raw[target_col])
 
-X_all = get_preprocessed_matrix(df_raw, feature_columns)
-y_all = df_raw[target_col].copy()
+raw_features_df = df_raw.drop(columns=[target_col]).copy()
+raw_features_df = normalize_for_model(raw_features_df)
 
-# Normalize y to 0/1 if needed
-if y_all.dtype == "O":
-    s = y_all.astype(str).str.strip().str.lower()
-
-    def map_target(v):
-        v = str(v).strip().lower()
-        if v in ["1", "true", "yes", "positive", "disease", "diseased", "abnormal", "hyper", "hypo", "present"]:
-            return 1
-        if v in ["0", "false", "no", "negative", "normal", "healthy", "ok", "absent"]:
-            return 0
-        if "positive" in v or "disease" in v or "abnormal" in v:
-            return 1
-        if "negative" in v or "normal" in v or "healthy" in v:
-            return 0
-        return 1 if v not in ["0", "false", "no"] else 0
-
-    y_all = s.map(map_target).astype(int)
+# Feature columns source
+if Path("feature_columns.pkl").exists():
+    try:
+        feature_columns = joblib.load("feature_columns.pkl")
+    except Exception:
+        feature_columns = pd.get_dummies(raw_features_df, drop_first=False).columns.tolist()
 else:
-    y_all = pd.to_numeric(y_all, errors="coerce").fillna(0).astype(int)
+    feature_columns = pd.get_dummies(raw_features_df, drop_first=False).columns.tolist()
 
+X_all = pd.get_dummies(raw_features_df, drop_first=False)
+X_all = align_features(X_all, feature_columns)
+
+# train/test split for app-side evaluation
 X_train, X_test, y_train, y_test = train_test_split(
     X_all,
     y_all,
@@ -599,30 +644,51 @@ X_train, X_test, y_train, y_test = train_test_split(
     stratify=y_all if y_all.nunique() == 2 else None,
 )
 
-# Load models
+# =========================================================
+# LOAD MODELS
+# =========================================================
 available_model_files = get_available_model_files()
-if not available_model_files:
-    st.error("No model files found. Save xgboost_model.pkl, random_forest_model.pkl, logistic_regression_model.pkl, decision_tree_model.pkl, svm_model.pkl.")
-    st.stop()
-
 models = {}
+
 for name, path in available_model_files.items():
     try:
-        models[name] = load_model(path)
+        models[name] = load_model_file(path)
     except Exception as e:
         st.warning(f"Could not load {name}: {e}")
 
 if not models:
-    st.error("No model could be loaded.")
+    st.error("No model could be loaded. Upload at least thyroid_model.pkl.")
     st.stop()
 
-# Evaluate models
+# =========================================================
+# EVALUATE MODELS
+# =========================================================
+def evaluate_model(model, X_test, y_test):
+    pred = model.predict(X_test)
+    avg = "binary" if pd.Series(y_test).nunique() == 2 else "weighted"
+    acc = accuracy_score(y_test, pred)
+    pre = precision_score(y_test, pred, average=avg, zero_division=0)
+    rec = recall_score(y_test, pred, average=avg, zero_division=0)
+    f1v = f1_score(y_test, pred, average=avg, zero_division=0)
+    cm = confusion_matrix(y_test, pred)
+    return {
+        "Accuracy": acc,
+        "Precision": pre,
+        "Recall": rec,
+        "F1": f1v,
+        "CM": cm
+    }
+
 model_scores = {}
 for name, model in models.items():
     try:
-        model_scores[name] = get_metrics_for_model(model, X_test, y_test)
+        model_scores[name] = evaluate_model(model, X_test, y_test)
     except Exception as e:
         st.warning(f"Could not evaluate {name}: {e}")
+
+if not model_scores:
+    st.error("No model could be evaluated. Please verify feature_columns.pkl and model files.")
+    st.stop()
 
 metrics_df = pd.DataFrame(
     {
@@ -630,27 +696,36 @@ metrics_df = pd.DataFrame(
             "Accuracy": vals["Accuracy"],
             "Precision": vals["Precision"],
             "Recall": vals["Recall"],
-            "F1": vals["F1 Score"],
+            "F1": vals["F1"],
         }
         for name, vals in model_scores.items()
     }
 ).T
 
-best_model_name = metrics_df["Accuracy"].idxmax()
+metrics_df = metrics_df.sort_values("Accuracy", ascending=False)
+best_model_name = metrics_df.index[0]
 best_model = models[best_model_name]
 best_metrics = model_scores[best_model_name]
-best_cm = best_metrics["CM"]
 
+# Selected model in UI
+selected_model_default_index = list(metrics_df.index).index(best_model_name)
 # =========================================================
-# Model selector and explainers
+# SIDEBAR
 # =========================================================
 with st.sidebar:
     st.markdown("## 🧠 ThyroPredict AI")
     st.caption("Explainable clinical dashboard")
 
-    model_choice = st.selectbox("Active Model", list(models.keys()), index=list(models.keys()).index(best_model_name))
+    model_choice = st.selectbox(
+        "Active Model",
+        list(metrics_df.index),
+        index=selected_model_default_index
+    )
     selected_model = models[model_choice]
     selected_metrics = model_scores[model_choice]
+
+    st.markdown("### 🏆 Best Model")
+    st.success(best_model_name)
 
     st.markdown("### 📈 Test Accuracy")
     for name in metrics_df.index:
@@ -670,23 +745,8 @@ with st.sidebar:
     st.write(f"Columns: **{len(df_raw.columns):,}**")
     st.write(f"Target: **{target_col}**")
 
-def get_selected_explainer(model_name, model):
-    try:
-        if model_name in ["XGBoost", "Random Forest", "Decision Tree"]:
-            return shap.TreeExplainer(model)
-        elif model_name == "Logistic Regression":
-            background = X_train.sample(min(100, len(X_train)), random_state=42)
-            return shap.LinearExplainer(model, background, feature_perturbation="interventional")
-        else:
-            background = X_train.sample(min(50, len(X_train)), random_state=42)
-            return shap.Explainer(model.predict_proba, background)
-    except Exception:
-        return None
-
-selected_explainer = get_selected_explainer(model_choice, selected_model)
-
 # =========================================================
-# Header
+# HEADER
 # =========================================================
 st.markdown(
     """
@@ -701,12 +761,12 @@ st.markdown(
 )
 
 # =========================================================
-# Tabs
+# TABS
 # =========================================================
 tab1, tab2, tab3, tab4 = st.tabs(["🩺 Prediction", "📊 Model Comparison", "🌍 Analytics", "📂 Batch Prediction"])
 
 # =========================================================
-# TAB 1: Prediction
+# TAB 1: PREDICTION
 # =========================================================
 with tab1:
     st.markdown("### 📋 Patient Input")
@@ -734,28 +794,15 @@ with tab1:
 
     if st.button("🚀 Run Diagnosis", type="primary", use_container_width=True):
         with st.spinner("Analyzing patient data..."):
-            input_df = build_featured_input(
-                patient_name,
-                age,
-                sex,
-                tsh,
-                fti,
-                feature_columns,
-                df_raw.columns.tolist()
-            )
+            input_raw = build_patient_raw_input(raw_features_df, age, sex, tsh, fti)
+            input_df = prepare_input_features(input_raw, feature_columns)
 
             pred_value = selected_model.predict(input_df)[0]
             pred_text = label_to_text(pred_value)
 
-            if hasattr(selected_model, "predict_proba"):
-                proba = selected_model.predict_proba(input_df)[0]
-                classes = list(selected_model.classes_) if hasattr(selected_model, "classes_") else None
-                if classes is not None and pred_value in classes:
-                    confidence = float(proba[classes.index(pred_value)]) * 100
-                else:
-                    confidence = float(np.max(proba)) * 100
-            else:
-                confidence = 100.0 if pred_text == "Positive" else 0.0
+            proba, classes, confidence = get_model_prob_and_confidence(
+                selected_model, input_df, pred_value
+            )
 
             recommendation, risk = doctor_recommendation(tsh, fti, ratio, pred_text, confidence)
             reasons = confidence_explanation(tsh, fti, ratio, confidence)
@@ -841,6 +888,7 @@ with tab1:
             st.write("•", r)
 
         st.markdown("### 🧠 Explainable AI (SHAP)")
+        selected_explainer = get_shap_explainer(model_choice, selected_model)
         if selected_explainer is not None:
             try:
                 shap_values = selected_explainer(input_df)
@@ -850,7 +898,7 @@ with tab1:
             except Exception as e:
                 st.info(f"SHAP waterfall could not be rendered in this run. ({e})")
         else:
-            st.info("Selected model does not support SHAP in this runtime.")
+            st.info("SHAP is shown for tree-based models like XGBoost / Random Forest / Decision Tree.")
 
         st.markdown("### 📈 Patient Live Chart")
         result_chart = make_live_chart(tsh, fti, pred_text)
@@ -880,7 +928,7 @@ with tab1:
         )
 
 # =========================================================
-# TAB 2: Model Comparison
+# TAB 2: MODEL COMPARISON
 # =========================================================
 with tab2:
     st.markdown("### 📊 Multi-model Performance")
@@ -903,11 +951,35 @@ with tab2:
     st.plotly_chart(cm_fig, use_container_width=True)
 
     st.markdown("### 🏆 Best Model Confusion Matrix")
-    best_cm_fig = build_confusion_figure(best_cm, f"{best_model_name} Confusion Matrix")
+    best_cm_fig = build_confusion_figure(best_metrics["CM"], f"{best_model_name} Confusion Matrix")
     st.plotly_chart(best_cm_fig, use_container_width=True)
 
+    st.markdown("### 📈 ROC Curve")
+    if hasattr(selected_model, "predict_proba"):
+        try:
+            selected_probs = selected_model.predict_proba(X_test)[:, 1]
+            fpr, tpr, thresholds = roc_curve(y_test, selected_probs)
+            roc_auc = auc(fpr, tpr)
+
+            roc_fig = go.Figure()
+            roc_fig.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"AUC = {roc_auc:.4f}"))
+            roc_fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random", line=dict(dash="dash")))
+            roc_fig.update_layout(
+                template="plotly_dark",
+                height=450,
+                title=f"ROC Curve - {model_choice}",
+                xaxis_title="False Positive Rate",
+                yaxis_title="True Positive Rate",
+                margin=dict(l=10, r=10, t=50, b=10),
+            )
+            st.plotly_chart(roc_fig, use_container_width=True)
+        except Exception as e:
+            st.info(f"ROC curve could not be rendered. ({e})")
+    else:
+        st.info("ROC curve not available because the selected model does not provide probabilities.")
+
 # =========================================================
-# TAB 3: Analytics
+# TAB 3: ANALYTICS
 # =========================================================
 with tab3:
     st.markdown("### 🧾 Dataset Overview")
@@ -942,16 +1014,21 @@ with tab3:
         st.info("Biomarker trend graph could not be generated.")
 
     st.markdown("### 🌍 Global Explainability")
-    if selected_explainer is not None:
+    global_model_name = best_model_name
+    global_model = best_model
+    global_explainer = get_shap_explainer(global_model_name, global_model)
+
+    if global_explainer is not None:
         try:
             sample_n = min(120, len(X_train))
             background = X_train.sample(sample_n, random_state=42) if len(X_train) > sample_n else X_train.copy()
-            shap_values = selected_explainer(background)
+            shap_values = global_explainer(background)
 
             try:
                 vals = np.abs(shap_values.values).mean(axis=0)
                 imp_df = pd.DataFrame({"Feature": background.columns, "Importance": vals})
                 imp_df = imp_df.sort_values("Importance", ascending=False).head(15)
+
                 imp_fig = px.bar(
                     imp_df.sort_values("Importance", ascending=True),
                     x="Importance",
@@ -966,10 +1043,10 @@ with tab3:
         except Exception as e:
             st.info(f"Global explainability unavailable. ({e})")
     else:
-        st.info("Global explainability is unavailable for the selected model.")
+        st.info("Global explainability is available mainly for tree-based models.")
 
 # =========================================================
-# TAB 4: Batch Prediction
+# TAB 4: BATCH PREDICTION
 # =========================================================
 with tab4:
     st.markdown("### 📂 Upload CSV for Batch Prediction")
@@ -984,7 +1061,10 @@ with tab4:
 
         if st.button("Run Batch Prediction", use_container_width=True):
             with st.spinner("Running batch prediction..."):
-                batch_X = get_preprocessed_matrix(batch_df, feature_columns)
+                batch_raw = batch_df.copy()
+                batch_raw = normalize_for_model(batch_raw)
+                batch_raw = pd.get_dummies(batch_raw, drop_first=False)
+                batch_X = align_features(batch_raw, feature_columns)
 
                 preds = selected_model.predict(batch_X)
                 pred_texts = [label_to_text(p) for p in preds]
@@ -1017,7 +1097,7 @@ with tab4:
         st.info("Upload a CSV file to run batch prediction.")
 
 # =========================================================
-# Footer
+# FOOTER
 # =========================================================
 st.markdown("---")
 st.markdown(
