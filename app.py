@@ -72,7 +72,7 @@ for col in required_features:
 
 # Extra feature remove + correct order maintain
 X = df[required_features]
-y = df['target']
+y = df['binaryClass']
 
 pred_all = model.predict(X)
 real_acc = accuracy_score(y, pred_all) * 100
