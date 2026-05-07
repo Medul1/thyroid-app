@@ -13,14 +13,13 @@ from fpdf import FPDF
 from pathlib import Path
 import warnings
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
     recall_score,
     f1_score,
     confusion_matrix,
-    classification_report,
     roc_curve,
     auc
 )
@@ -28,7 +27,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import SVC
-from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
 
@@ -43,7 +41,7 @@ st.set_page_config(
 )
 
 # =========================================================
-# GLOBAL STYLE
+# STYLE
 # =========================================================
 st.markdown(
     """
@@ -132,7 +130,7 @@ FTI_NORMAL = (60.0, 160.0)
 RATIO_NORMAL = (0.003, 0.067)
 
 # =========================================================
-# HELPER FUNCTIONS
+# HELPERS
 # =========================================================
 def clean_columns(df):
     df = df.copy()
@@ -202,6 +200,15 @@ def normalize_for_model(df):
 
     return df
 
+@st.cache_data
+def load_dataset():
+    df = pd.read_csv("cleaned_dataset_Thyroid1.csv")
+    return clean_columns(df)
+
+@st.cache_resource
+def load_model_file(path):
+    return joblib.load(path)
+
 def get_available_model_files():
     model_files = {
         "XGBoost": "xgboost_model.pkl",
@@ -219,15 +226,6 @@ def get_available_model_files():
         available["Best Model"] = "thyroid_model.pkl"
 
     return available
-
-@st.cache_resource
-def load_model_file(path):
-    return joblib.load(path)
-
-@st.cache_data
-def load_dataset():
-    df = pd.read_csv("cleaned_dataset_Thyroid1.csv")
-    return clean_columns(df)
 
 def align_features(df, feature_columns):
     df = clean_columns(df)
@@ -623,7 +621,6 @@ y_all = normalize_target(df_raw[target_col])
 raw_features_df = df_raw.drop(columns=[target_col]).copy()
 raw_features_df = normalize_for_model(raw_features_df)
 
-# Feature columns source
 if Path("feature_columns.pkl").exists():
     try:
         feature_columns = joblib.load("feature_columns.pkl")
@@ -635,7 +632,6 @@ else:
 X_all = pd.get_dummies(raw_features_df, drop_first=False)
 X_all = align_features(X_all, feature_columns)
 
-# train/test split for app-side evaluation
 X_train, X_test, y_train, y_test = train_test_split(
     X_all,
     y_all,
@@ -707,8 +703,6 @@ best_model_name = metrics_df.index[0]
 best_model = models[best_model_name]
 best_metrics = model_scores[best_model_name]
 
-# Selected model in UI
-selected_model_default_index = list(metrics_df.index).index(best_model_name)
 # =========================================================
 # SIDEBAR
 # =========================================================
@@ -719,7 +713,7 @@ with st.sidebar:
     model_choice = st.selectbox(
         "Active Model",
         list(metrics_df.index),
-        index=selected_model_default_index
+        index=list(metrics_df.index).index(best_model_name)
     )
     selected_model = models[model_choice]
     selected_metrics = model_scores[model_choice]
@@ -790,7 +784,7 @@ with tab1:
 
     st.markdown("### 📊 Live TSH vs FTI Chart")
     live_fig = make_live_chart(tsh, fti, None)
-    st.plotly_chart(live_fig, use_container_width=True)
+    st.plotly_chart(live_fig, use_container_width=True, key="live_chart")
 
     if st.button("🚀 Run Diagnosis", type="primary", use_container_width=True):
         with st.spinner("Analyzing patient data..."):
@@ -902,7 +896,7 @@ with tab1:
 
         st.markdown("### 📈 Patient Live Chart")
         result_chart = make_live_chart(tsh, fti, pred_text)
-        st.plotly_chart(result_chart, use_container_width=True)
+        st.plotly_chart(result_chart, use_container_width=True, key="result_chart")
 
         st.markdown("### 📄 Export Report")
         pdf_bytes = make_pdf_report(
@@ -934,7 +928,7 @@ with tab2:
     st.markdown("### 📊 Multi-model Performance")
 
     comparison_fig = build_metric_chart(metrics_df)
-    st.plotly_chart(comparison_fig, use_container_width=True)
+    st.plotly_chart(comparison_fig, use_container_width=True, key="comparison_chart")
 
     best_row = metrics_df.loc[best_model_name]
     st.success(
@@ -948,11 +942,11 @@ with tab2:
 
     st.markdown("### 📉 Confusion Matrix of Selected Model")
     cm_fig = build_confusion_figure(selected_metrics["CM"], f"{model_choice} Confusion Matrix")
-    st.plotly_chart(cm_fig, use_container_width=True)
+    st.plotly_chart(cm_fig, use_container_width=True, key="selected_cm")
 
     st.markdown("### 🏆 Best Model Confusion Matrix")
     best_cm_fig = build_confusion_figure(best_metrics["CM"], f"{best_model_name} Confusion Matrix")
-    st.plotly_chart(best_cm_fig, use_container_width=True)
+    st.plotly_chart(best_cm_fig, use_container_width=True, key="best_cm")
 
     st.markdown("### 📈 ROC Curve")
     if hasattr(selected_model, "predict_proba"):
@@ -972,7 +966,7 @@ with tab2:
                 yaxis_title="True Positive Rate",
                 margin=dict(l=10, r=10, t=50, b=10),
             )
-            st.plotly_chart(roc_fig, use_container_width=True)
+            st.plotly_chart(roc_fig, use_container_width=True, key="roc_curve")
         except Exception as e:
             st.info(f"ROC curve could not be rendered. ({e})")
     else:
@@ -997,19 +991,19 @@ with tab3:
 
     st.markdown("### 🥧 Disease Distribution")
     pie_fig = build_pie_chart(df_raw, target_col)
-    st.plotly_chart(pie_fig, use_container_width=True)
+    st.plotly_chart(pie_fig, use_container_width=True, key="pie_chart")
 
     st.markdown("### 🌡️ Correlation Heatmap")
     corr_fig = build_correlation_heatmap(df_raw, exclude_col=target_col)
     if corr_fig is not None:
-        st.plotly_chart(corr_fig, use_container_width=True)
+        st.plotly_chart(corr_fig, use_container_width=True, key="corr_heatmap")
     else:
         st.info("Correlation heatmap could not be generated because numeric columns are insufficient.")
 
     st.markdown("### 📈 Biomarker Trend")
     trend_fig = build_biomarker_trend(df_raw)
     if trend_fig is not None:
-        st.plotly_chart(trend_fig, use_container_width=True)
+        st.plotly_chart(trend_fig, use_container_width=True, key="trend_chart")
     else:
         st.info("Biomarker trend graph could not be generated.")
 
@@ -1037,7 +1031,7 @@ with tab3:
                     title="Top SHAP Feature Importance"
                 )
                 imp_fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10, r=10, t=50, b=10))
-                st.plotly_chart(imp_fig, use_container_width=True)
+                st.plotly_chart(imp_fig, use_container_width=True, key="global_importance")
             except Exception:
                 st.info("Could not render global feature importance chart.")
         except Exception as e:
