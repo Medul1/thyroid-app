@@ -1,9 +1,8 @@
 streamlit
-pandas
-xgboost
 joblib
-shap
-matplotlib
+pandas
 numpy
-scikit-learn
+shap
+plotly
 fpdf
+scikit-learn
