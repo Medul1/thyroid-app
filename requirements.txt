@@ -6,3 +6,5 @@ shap
 plotly
 fpdf
 scikit-learn
+xgboost
+matplotlib
