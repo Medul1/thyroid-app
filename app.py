@@ -62,7 +62,16 @@ if not st.session_state.login:
 # ===============================
 # REAL ACCURACY CALCULATION
 # ===============================
-X = df[model.feature_names_in_]
+# Model required feature list
+required_features = list(model.feature_names_in_)
+
+# Missing feature automatically add
+for col in required_features:
+    if col not in df.columns:
+        df[col] = 0
+
+# Extra feature remove + correct order maintain
+X = df[required_features]
 y = df['target']
 
 pred_all = model.predict(X)
