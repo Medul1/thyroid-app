@@ -894,6 +894,14 @@ with tab1:
         else:
             st.info("SHAP is shown for tree-based models like XGBoost / Random Forest / Decision Tree.")
 
+        st.markdown("""
+### 🔍 Explainable AI Interpretation
+
+The Explainable AI framework identified TSH as the most influential contributor toward the final prediction, while FTI and the engineered TSH/FTI ratio provided complementary diagnostic significance.
+
+The visualization illustrates how each biomarker contributed either positively or negatively toward the AI-generated diagnostic outcome.
+""")
+
         st.markdown("### 📈 Patient Live Chart")
         result_chart = make_live_chart(tsh, fti, pred_text)
         st.plotly_chart(result_chart, use_container_width=True, key="result_chart")
