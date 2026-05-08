@@ -968,26 +968,26 @@ No major biochemical thyroid abnormality was strongly indicated by the AI system
 """)
 
 st.markdown("### 📈 Patient Live Chart")
-        result_chart = make_live_chart(tsh, fti, pred_text)
-        st.plotly_chart(result_chart, use_container_width=True, key="result_chart")
+result_chart = make_live_chart(tsh, fti, pred_text)
+st.plotly_chart(result_chart, use_container_width=True, key="result_chart")
 
-        st.markdown("### 📄 Export Report")
-        pdf_bytes = make_pdf_report(
-            patient_name,
-            age,
-            sex,
-            tsh,
-            fti,
-            ratio,
-            pred_text,
-            confidence,
-            recommendation,
-            risk,
-            model_choice,
-            metrics_df.loc[model_choice, "Accuracy"],
-        )
-        st.download_button(
-            "Download PDF Report",
+st.markdown("### 📄 Export Report")
+pdf_bytes = make_pdf_report(
+    patient_name,
+    age,
+    sex,
+    tsh,
+    fti,
+    ratio,
+    pred_text,
+    confidence,
+    recommendation,
+    risk,
+    model_choice,
+    metrics_df.loc[model_choice, "Accuracy"],
+)
+st.download_button(
+     "Download PDF Report",
             data=pdf_bytes,
             file_name=f"{patient_name}_thyroid_report.pdf",
             mime="application/pdf",
