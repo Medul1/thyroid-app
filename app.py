@@ -967,9 +967,7 @@ The interaction between TSH and FTI closely resembled previously learned healthy
 No major biochemical thyroid abnormality was strongly indicated by the AI system during this evaluation.
 """)
 
-    
-
-        st.markdown("### 📈 Patient Live Chart")
+st.markdown("### 📈 Patient Live Chart")
         result_chart = make_live_chart(tsh, fti, pred_text)
         st.plotly_chart(result_chart, use_container_width=True, key="result_chart")
 
