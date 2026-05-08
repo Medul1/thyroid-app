@@ -894,13 +894,80 @@ with tab1:
         else:
             st.info("SHAP is shown for tree-based models like XGBoost / Random Forest / Decision Tree.")
 
-        st.markdown("""
-### 🔍 Explainable AI Interpretation
 
-The Explainable AI framework identified TSH as the most influential contributor toward the final prediction, while FTI and the engineered TSH/FTI ratio provided complementary diagnostic significance.
+        st.markdown("---")
+st.markdown("## 🧠 AI Clinical Reasoning")
 
-The visualization illustrates how each biomarker contributed either positively or negatively toward the AI-generated diagnostic outcome.
+# POSITIVE CASE
+if prediction == 1:
+
+    if p_tsh > 4.5 and p_fti < 60:
+
+        st.error(f"""
+### 🚨 Why the Patient is Predicted as Positive
+
+The Explainable AI analysis identified abnormal hormonal interaction patterns strongly associated with thyroid dysfunction.
+
+### Key Biomarker Observations:
+- **TSH Level:** {p_tsh:.2f} → Elevated above normal physiological range
+- **FTI Level:** {p_fti:.2f} → Relatively reduced thyroid hormone availability
+- **TSH/FTI Ratio:** {p_ratio:.4f} → Indicates endocrine imbalance pattern
+
+### AI-Based Interpretation:
+The SHAP explainability framework demonstrated that the elevated TSH level contributed significantly toward the positive diagnostic outcome.
+
+At the same time, the comparatively reduced FTI level reinforced the likelihood of impaired thyroid hormone regulation.
+
+The combined interaction between these biomarkers closely matched thyroid disease patterns previously learned from the clinical training dataset.
+
+### Clinical Insight:
+This hormonal profile may be suggestive of hypothyroid-related endocrine dysfunction and may require additional clinical evaluation.
 """)
+
+    else:
+
+        st.warning(f"""
+### ⚠️ Why the Patient is Predicted as Positive
+
+The AI model identified partially abnormal endocrine interaction characteristics.
+
+### Key Biomarker Observations:
+- **TSH Level:** {p_tsh:.2f}
+- **FTI Level:** {p_fti:.2f}
+- **TSH/FTI Ratio:** {p_ratio:.4f}
+
+### AI-Based Interpretation:
+Although certain biomarkers remain near physiological limits, the combined feature interaction pattern demonstrated similarity with previously observed thyroid dysfunction cases.
+
+The Explainable AI analysis suggests that multiple biomarkers collectively increased the disease prediction probability.
+
+### Clinical Insight:
+Borderline hormonal imbalance patterns may benefit from further endocrine investigation and laboratory follow-up.
+""")
+
+# NEGATIVE CASE
+else:
+
+    st.success(f"""
+### ✅ Why the Patient is Predicted as Negative
+
+The Explainable AI analysis identified a hormonally balanced thyroid profile without strong evidence of endocrine dysfunction.
+
+### Key Biomarker Observations:
+- **TSH Level:** {p_tsh:.2f} → Within acceptable physiological range
+- **FTI Level:** {p_fti:.2f} → Indicates adequate thyroid hormone availability
+- **TSH/FTI Ratio:** {p_ratio:.4f} → Demonstrates balanced endocrine interaction
+
+### AI-Based Interpretation:
+The SHAP framework showed that the analyzed biomarkers contributed toward a stable and non-diseased prediction pattern.
+
+The interaction between TSH and FTI closely resembled previously learned healthy thyroid function profiles from the training dataset.
+
+### Clinical Insight:
+No major biochemical thyroid abnormality was strongly indicated by the AI system during this evaluation.
+""")
+
+    
 
         st.markdown("### 📈 Patient Live Chart")
         result_chart = make_live_chart(tsh, fti, pred_text)
