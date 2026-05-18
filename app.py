@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import joblib
 import pandas as pd
 import numpy as np
@@ -23,10 +24,8 @@ from sklearn.metrics import (
     roc_curve,
     auc
 )
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.svm import SVC
+
+from lime.lime_tabular import LimeTabularExplainer
 
 warnings.filterwarnings("ignore")
 
@@ -167,12 +166,40 @@ def normalize_target(series):
 
     return pd.to_numeric(series, errors="coerce").fillna(0).astype(int)
 
-def normalize_for_model(df):
+def feature_engineering(df):
     df = clean_columns(df)
 
-    if "TSH" in df.columns and "FTI" in df.columns and "TSH_FTI_Ratio" not in df.columns:
-        df["TSH_FTI_Ratio"] = df["TSH"] / (df["FTI"].replace(0, np.nan) + 0.001)
-        df["TSH_FTI_Ratio"] = df["TSH_FTI_Ratio"].fillna(0)
+    numeric_cols = ["age", "TSH", "T3", "TT4", "T4U", "FTI"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+
+    if "TSH" in df.columns and "FTI" in df.columns:
+        df["TSH_FTI_Ratio"] = df["TSH"] / (df["FTI"] + 0.001)
+    else:
+        df["TSH_FTI_Ratio"] = 0
+
+    if "age" in df.columns and "TSH" in df.columns:
+        df["Age_TSH_Interaction"] = df["age"] * df["TSH"]
+    else:
+        df["Age_TSH_Interaction"] = 0
+
+    # Hormone imbalance score: simple weighted score for clinical interaction
+    for col in ["TSH", "T3", "TT4", "T4U", "FTI"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    df["Hormone_Imbalance_Score"] = (
+        (0.30 * df["TSH"]) +
+        (0.20 * df["T3"]) +
+        (0.20 * df["TT4"]) +
+        (0.10 * df["T4U"]) +
+        (0.20 * df["FTI"])
+    )
 
     if "age" in df.columns and "Age_Group" not in df.columns:
         try:
@@ -211,6 +238,7 @@ def load_model_file(path):
 
 def get_available_model_files():
     model_files = {
+        "Stacking Ensemble": "stacking_ensemble_model.pkl",
         "XGBoost": "xgboost_model.pkl",
         "Random Forest": "random_forest_model.pkl",
         "Logistic Regression": "logistic_regression_model.pkl",
@@ -250,7 +278,7 @@ def build_default_raw_row(template_df):
             row[col] = mode.iloc[0] if len(mode) else ""
     return row
 
-def build_patient_raw_input(template_df, age, sex, tsh, fti):
+def build_patient_raw_input(template_df, age, sex, tsh, t3, tt4, t4u, fti, flags):
     row = build_default_raw_row(template_df)
 
     if "age" in row:
@@ -259,22 +287,40 @@ def build_patient_raw_input(template_df, age, sex, tsh, fti):
         row["Age"] = age
 
     if "sex" in row:
-        if pd.api.types.is_numeric_dtype(template_df["sex"]):
-            row["sex"] = 1 if sex == "Male" else 0
-        else:
-            row["sex"] = sex
+        row["sex"] = 1 if sex == "Male" else 0
     if "Sex" in row:
-        if pd.api.types.is_numeric_dtype(template_df["Sex"]):
-            row["Sex"] = 1 if sex == "Male" else 0
-        else:
-            row["Sex"] = sex
+        row["Sex"] = 1 if sex == "Male" else 0
 
-    if "TSH" in row:
-        row["TSH"] = tsh
-    if "FTI" in row:
-        row["FTI"] = fti
+    for col, value in {
+        "TSH": tsh,
+        "T3": t3,
+        "TT4": tt4,
+        "T4U": t4u,
+        "FTI": fti,
+    }.items():
+        if col in row:
+            row[col] = value
+
+    # Optional clinical flags
+    for key, value in flags.items():
+        if key in row:
+            row[key] = value
+
+    # Derived features
     if "TSH_FTI_Ratio" in row:
         row["TSH_FTI_Ratio"] = tsh / (fti + 0.001)
+
+    if "Age_TSH_Interaction" in row:
+        row["Age_TSH_Interaction"] = age * tsh
+
+    if "Hormone_Imbalance_Score" in row:
+        row["Hormone_Imbalance_Score"] = (
+            (0.30 * tsh) +
+            (0.20 * t3) +
+            (0.20 * tt4) +
+            (0.10 * t4u) +
+            (0.20 * fti)
+        )
 
     if "Age_Group" in row:
         if age < 30:
@@ -285,16 +331,12 @@ def build_patient_raw_input(template_df, age, sex, tsh, fti):
             row["Age_Group"] = 2
 
     if "Symptom_Score" in row:
-        row["Symptom_Score"] = 0
-
-    for measured in ["TSH measured", "FTI measured", "T3 measured", "TT4 measured", "T4U measured"]:
-        if measured in row:
-            row[measured] = 1 if measured in ["TSH measured", "FTI measured"] else 0
+        row["Symptom_Score"] = int(sum(flags.values()))
 
     return pd.DataFrame([row])
 
 def prepare_input_features(patient_df, feature_columns):
-    patient_df = normalize_for_model(patient_df)
+    patient_df = feature_engineering(patient_df)
     patient_df = pd.get_dummies(patient_df, drop_first=False)
     patient_df = align_features(patient_df, feature_columns)
     return patient_df
@@ -316,7 +358,35 @@ def label_to_text(value):
             return "Positive"
         return "Negative"
 
-def doctor_recommendation(tsh, fti, ratio, verdict_text, confidence):
+def predict_proba_safe(model, input_df):
+    if hasattr(model, "predict_proba"):
+        try:
+            proba = model.predict_proba(input_df)[0]
+            classes = list(model.classes_) if hasattr(model, "classes_") else None
+            return proba, classes
+        except Exception:
+            return None, None
+    return None, None
+
+def get_model_prediction(model, input_df, threshold=0.5):
+    pred = None
+    positive_prob = None
+    classes = None
+
+    proba, classes = predict_proba_safe(model, input_df)
+    if proba is not None:
+        positive_prob = float(proba[1]) if len(proba) > 1 else float(np.max(proba))
+        pred = 1 if positive_prob >= threshold else 0
+    else:
+        try:
+            pred = int(model.predict(input_df)[0])
+        except Exception:
+            pred = 0
+
+    confidence = choose_confidence(pred, proba, classes) if proba is not None else 100.0
+    return pred, positive_prob, confidence, classes
+
+def doctor_recommendation(tsh, fti, ratio, verdict_text, confidence, disagreement=False):
     if tsh > TSH_NORMAL[1] and fti < FTI_NORMAL[0]:
         rec = "Possible hypothyroid indication. Recommend endocrinologist consultation."
         risk = "High"
@@ -332,6 +402,14 @@ def doctor_recommendation(tsh, fti, ratio, verdict_text, confidence):
 
     if confidence < 70 and risk == "Low":
         risk = "Medium"
+
+    if disagreement:
+        if risk == "Low":
+            risk = "Medium"
+        elif risk == "Medium":
+            risk = "High"
+        elif risk == "High":
+            risk = "Critical"
 
     return rec, risk
 
@@ -506,7 +584,7 @@ def build_biomarker_trend(df):
     fig.update_yaxes(title_text="FTI", secondary_y=True)
     return fig
 
-def make_pdf_report(name, age, sex, tsh, fti, ratio, verdict, confidence, recommendation, risk, model_name, model_acc):
+def make_pdf_report(name, age, sex, tsh, t3, tt4, t4u, fti, ratio, verdict, confidence, recommendation, risk, model_name, model_acc):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=12)
@@ -530,6 +608,9 @@ def make_pdf_report(name, age, sex, tsh, fti, ratio, verdict, confidence, recomm
     pdf.cell(0, 8, "Clinical Parameters", ln=True)
     pdf.set_font("Arial", "", 11)
     pdf.cell(0, 7, f"TSH: {tsh:.3f}", ln=True)
+    pdf.cell(0, 7, f"T3: {t3:.3f}", ln=True)
+    pdf.cell(0, 7, f"TT4: {tt4:.3f}", ln=True)
+    pdf.cell(0, 7, f"T4U: {t4u:.3f}", ln=True)
     pdf.cell(0, 7, f"FTI: {fti:.3f}", ln=True)
     pdf.cell(0, 7, f"TSH/FTI Ratio: {ratio:.5f}", ln=True)
 
@@ -551,31 +632,128 @@ def make_pdf_report(name, age, sex, tsh, fti, ratio, verdict, confidence, recomm
 
     return pdf.output(dest="S").encode("latin-1")
 
-def get_shap_explainer(model_name, model):
+def get_model_feature_importance(model, feature_names):
     try:
-        if model_name in ["XGBoost", "Random Forest", "Decision Tree", "Best Model"]:
+        if hasattr(model, "feature_importances_"):
+            values = np.array(model.feature_importances_, dtype=float).ravel()
+        elif hasattr(model, "coef_"):
+            values = np.abs(np.array(model.coef_, dtype=float)).ravel()
+        else:
+            return pd.Series(dtype=float)
+
+        model_names = list(getattr(model, "feature_names_in_", feature_names[:len(values)]))
+        if len(model_names) != len(values):
+            model_names = feature_names[:len(values)]
+
+        s = pd.Series(values, index=model_names)
+        s = s.reindex(feature_names).fillna(0.0)
+        total = s.sum()
+        if total > 0:
+            s = s / total
+        return s
+    except Exception:
+        return pd.Series(dtype=float)
+
+def build_consensus_importance(models_dict, feature_names):
+    model_series = []
+    for m in models_dict.values():
+        s = get_model_feature_importance(m, feature_names)
+        if not s.empty:
+            model_series.append(s)
+
+    if not model_series:
+        return pd.DataFrame(columns=["Feature", "Consensus Importance"])
+
+    consensus = pd.concat(model_series, axis=1).fillna(0).mean(axis=1)
+    out = consensus.sort_values(ascending=False).reset_index()
+    out.columns = ["Feature", "Consensus Importance"]
+    return out
+
+def get_shap_explainer(model_name, model, background):
+    try:
+        if model_name in ["Stacking Ensemble", "XGBoost", "Random Forest", "Decision Tree", "Best Model"]:
             return shap.TreeExplainer(model)
-        return None
+        if hasattr(model, "coef_"):
+            return shap.LinearExplainer(model, background, feature_perturbation="interventional")
     except Exception:
         return None
+    return None
 
-def get_model_prob_and_confidence(model, input_df, pred_value):
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(input_df)[0]
-        classes = list(model.classes_) if hasattr(model, "classes_") else None
-        confidence = choose_confidence(pred_value, proba, classes)
-        return proba, classes, confidence
-    return None, None, 100.0
+def get_lime_explainer(background_df):
+    return LimeTabularExplainer(
+        training_data=np.array(background_df),
+        feature_names=list(background_df.columns),
+        class_names=["Negative", "Positive"],
+        mode="classification",
+        discretize_continuous=True
+    )
+
+def get_model_disagreement(models_dict, input_df):
+    rows = []
+    preds = []
+    probs = []
+
+    for name, model in models_dict.items():
+        try:
+            pred, positive_prob, confidence, classes = get_model_prediction(model, input_df, threshold=0.5)
+            preds.append(pred)
+            if positive_prob is not None:
+                probs.append(positive_prob)
+            rows.append({
+                "Model": name,
+                "Prediction": "Positive" if pred == 1 else "Negative",
+                "Positive Probability": None if positive_prob is None else round(positive_prob * 100, 2),
+                "Confidence %": round(confidence, 2)
+            })
+        except Exception as e:
+            rows.append({
+                "Model": name,
+                "Prediction": "Error",
+                "Positive Probability": None,
+                "Confidence %": None
+            })
+
+    disagree = len(set(preds)) > 1 if preds else False
+    prob_std = float(np.std(probs)) if len(probs) > 1 else 0.0
+    avg_prob = float(np.mean(probs)) if len(probs) > 0 else None
+
+    return pd.DataFrame(rows), disagree, prob_std, avg_prob
+
+def escalate_risk(risk):
+    order = ["Low", "Medium", "High", "Critical"]
+    if risk not in order:
+        return risk
+    idx = min(order.index(risk) + 1, len(order) - 1)
+    return order[idx]
+
+def final_risk_level(confidence, disagreement=False, prob_std=0.0):
+    if confidence < 50:
+        risk = "Low"
+    elif confidence < 70:
+        risk = "Medium"
+    elif confidence < 90:
+        risk = "High"
+    else:
+        risk = "Critical"
+
+    if disagreement or prob_std > 0.18:
+        risk = escalate_risk(risk)
+    return risk
+
+def predict_row_with_threshold(model, input_df, threshold=0.5):
+    pred, positive_prob, confidence, classes = get_model_prediction(model, input_df, threshold=threshold)
+    if positive_prob is not None:
+        pred = 1 if positive_prob >= threshold else 0
+    return pred, positive_prob, confidence
 
 # =========================================================
-# LOGIN
+# USERS / LOGIN
 # =========================================================
 try:
     with open("users.json") as f:
         users = json.load(f)
-except Exception as e:
-    st.error(f"users.json file not found. Error: {e}")
-    st.stop()
+except Exception:
+    users = {"admin": "1234"}
 
 if "login" not in st.session_state:
     st.session_state.login = False
@@ -616,29 +794,11 @@ if target_col is None:
     st.error("No target column found in the dataset. Use binaryClass / Class / target-like column.")
     st.stop()
 
-y_all = normalize_target(df_raw[target_col])
-
 raw_features_df = df_raw.drop(columns=[target_col]).copy()
-raw_features_df = normalize_for_model(raw_features_df)
+raw_features_df = clean_columns(raw_features_df)
+raw_features_df = feature_engineering(raw_features_df)
 
-if Path("feature_columns.pkl").exists():
-    try:
-        feature_columns = joblib.load("feature_columns.pkl")
-    except Exception:
-        feature_columns = pd.get_dummies(raw_features_df, drop_first=False).columns.tolist()
-else:
-    feature_columns = pd.get_dummies(raw_features_df, drop_first=False).columns.tolist()
-
-X_all = pd.get_dummies(raw_features_df, drop_first=False)
-X_all = align_features(X_all, feature_columns)
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X_all,
-    y_all,
-    test_size=0.2,
-    random_state=42,
-    stratify=y_all if y_all.nunique() == 2 else None,
-)
+y_all = normalize_target(df_raw[target_col])
 
 # =========================================================
 # LOAD MODELS
@@ -653,8 +813,53 @@ for name, path in available_model_files.items():
         st.warning(f"Could not load {name}: {e}")
 
 if not models:
-    st.error("No model could be loaded. Upload at least thyroid_model.pkl.")
+    st.error("No model could be loaded. Please upload at least one trained model file.")
     st.stop()
+
+# =========================================================
+# FEATURE COLUMNS
+# =========================================================
+if Path("feature_columns.pkl").exists():
+    try:
+        feature_columns = joblib.load("feature_columns.pkl")
+    except Exception:
+        feature_columns = pd.get_dummies(raw_features_df, drop_first=False).columns.tolist()
+else:
+    model_feature_cols = None
+    for m in models.values():
+        if hasattr(m, "feature_names_in_"):
+            model_feature_cols = list(m.feature_names_in_)
+            break
+    if model_feature_cols is not None:
+        feature_columns = model_feature_cols
+    else:
+        feature_columns = pd.get_dummies(raw_features_df, drop_first=False).columns.tolist()
+
+X_all = pd.get_dummies(raw_features_df, drop_first=False)
+X_all = align_features(X_all, feature_columns)
+
+# =========================================================
+# TRAIN / TEST SPLIT FOR METRICS + BACKGROUND
+# =========================================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X_all,
+    y_all,
+    test_size=0.2,
+    random_state=42,
+    stratify=y_all if y_all.nunique() == 2 else None,
+)
+
+# =========================================================
+# LOAD THRESHOLD
+# =========================================================
+threshold_value = 0.5
+for p in ["threshold_value.pkl", "threshold.pkl"]:
+    if Path(p).exists():
+        try:
+            threshold_value = float(joblib.load(p))
+            break
+        except Exception:
+            pass
 
 # =========================================================
 # EVALUATE MODELS
@@ -667,11 +872,24 @@ def evaluate_model(model, X_test, y_test):
     rec = recall_score(y_test, pred, average=avg, zero_division=0)
     f1v = f1_score(y_test, pred, average=avg, zero_division=0)
     cm = confusion_matrix(y_test, pred)
+
+    auc_val = None
+    if hasattr(model, "predict_proba"):
+        try:
+            probs = model.predict_proba(X_test)
+            if probs.shape[1] > 1:
+                positive_probs = probs[:, 1]
+                fpr, tpr, _ = roc_curve(y_test, positive_probs)
+                auc_val = auc(fpr, tpr)
+        except Exception:
+            auc_val = None
+
     return {
         "Accuracy": acc,
         "Precision": pre,
         "Recall": rec,
         "F1": f1v,
+        "AUC": auc_val,
         "CM": cm
     }
 
@@ -683,7 +901,7 @@ for name, model in models.items():
         st.warning(f"Could not evaluate {name}: {e}")
 
 if not model_scores:
-    st.error("No model could be evaluated. Please verify feature_columns.pkl and model files.")
+    st.error("No model could be evaluated. Please verify feature columns and model files.")
     st.stop()
 
 metrics_df = pd.DataFrame(
@@ -693,6 +911,7 @@ metrics_df = pd.DataFrame(
             "Precision": vals["Precision"],
             "Recall": vals["Recall"],
             "F1": vals["F1"],
+            "AUC": vals["AUC"] if vals["AUC"] is not None else np.nan
         }
         for name, vals in model_scores.items()
     }
@@ -702,6 +921,20 @@ metrics_df = metrics_df.sort_values("Accuracy", ascending=False)
 best_model_name = metrics_df.index[0]
 best_model = models[best_model_name]
 best_metrics = model_scores[best_model_name]
+
+# Tree-based model for SHAP
+tree_model_name = None
+for candidate in ["Stacking Ensemble", "XGBoost", "Random Forest", "Decision Tree"]:
+    if candidate in models:
+        tree_model_name = candidate
+        break
+if tree_model_name is None:
+    tree_model_name = best_model_name
+
+tree_model = models[tree_model_name]
+shap_background = X_train.sample(min(150, len(X_train)), random_state=42) if len(X_train) > 150 else X_train.copy()
+
+consensus_importance_df = build_consensus_importance(models, feature_columns)
 
 # =========================================================
 # SIDEBAR
@@ -720,6 +953,9 @@ with st.sidebar:
 
     st.markdown("### 🏆 Best Model")
     st.success(best_model_name)
+
+    st.markdown("### ⚙️ Threshold")
+    st.info(f"Decision threshold: {threshold_value:.3f}")
 
     st.markdown("### 📈 Test Accuracy")
     for name in metrics_df.index:
@@ -765,41 +1001,75 @@ tab1, tab2, tab3, tab4 = st.tabs(["🩺 Prediction", "📊 Model Comparison", "�
 with tab1:
     st.markdown("### 📋 Patient Input")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
 
     with c1:
         patient_name = st.text_input("Patient Name", "Patient_01")
         age = st.slider("Age", 1, 100, 30)
         sex = st.selectbox("Sex", ["Female", "Male"])
+        tsh = st.number_input("TSH", value=6.0, min_value=0.0, step=0.1)
+        t3 = st.number_input("T3", value=1.5, min_value=0.0, step=0.1)
 
     with c2:
-        tsh = st.number_input("TSH", value=6.0, min_value=0.0, step=0.1)
+        tt4 = st.number_input("TT4", value=120.0, min_value=0.0, step=0.1)
+        t4u = st.number_input("T4U", value=1.0, min_value=0.0, step=0.01)
         fti = st.number_input("FTI", value=50.0, min_value=0.0, step=0.1)
+        on_thyroxine = st.selectbox("On Thyroxine", ["No", "Yes"])
+        query_on_thyroxine = st.selectbox("Query On Thyroxine", ["No", "Yes"])
 
     with c3:
-        ratio = tsh / (fti + 0.001)
-        st.metric("TSH/FTI Ratio", f"{ratio:.5f}")
-        st.metric("Selected Model", model_choice)
-        st.metric("Best Model", best_model_name)
+        query_hypothyroid = st.selectbox("Query Hypothyroid", ["No", "Yes"])
+        query_hyperthyroid = st.selectbox("Query Hyperthyroid", ["No", "Yes"])
+        pregnant = st.selectbox("Pregnant", ["No", "Yes"])
+        thyroid_surgery = st.selectbox("Thyroid Surgery", ["No", "Yes"])
+        goitre = st.selectbox("Goitre", ["No", "Yes"])
+
+    with c4:
+        tumor = st.selectbox("Tumor", ["No", "Yes"])
+        sick = st.selectbox("Sick", ["No", "Yes"])
+        psych = st.selectbox("Psych", ["No", "Yes"])
+        lithium = st.selectbox("Lithium", ["No", "Yes"])
+        st.metric("TSH/FTI Ratio", f"{tsh / (fti + 0.001):.5f}")
+
+    flags = {
+        "on thyroxine": 1 if on_thyroxine == "Yes" else 0,
+        "query on thyroxine": 1 if query_on_thyroxine == "Yes" else 0,
+        "query hypothyroid": 1 if query_hypothyroid == "Yes" else 0,
+        "query hyperthyroid": 1 if query_hyperthyroid == "Yes" else 0,
+        "pregnant": 1 if pregnant == "Yes" else 0,
+        "thyroid surgery": 1 if thyroid_surgery == "Yes" else 0,
+        "goitre": 1 if goitre == "Yes" else 0,
+        "tumor": 1 if tumor == "Yes" else 0,
+        "sick": 1 if sick == "Yes" else 0,
+        "psych": 1 if psych == "Yes" else 0,
+        "lithium": 1 if lithium == "Yes" else 0,
+    }
 
     st.markdown("### 📊 Live TSH vs FTI Chart")
     live_fig = make_live_chart(tsh, fti, None)
-    st.plotly_chart(live_fig, use_container_width=True, key="live_chart")
+    st.plotly_chart(live_fig, use_container_width=True)
 
     if st.button("🚀 Run Diagnosis", type="primary", use_container_width=True):
         with st.spinner("Analyzing patient data..."):
-            input_raw = build_patient_raw_input(raw_features_df, age, sex, tsh, fti)
+            input_raw = build_patient_raw_input(
+                raw_features_df,
+                age, sex, tsh, t3, tt4, t4u, fti, flags
+            )
             input_df = prepare_input_features(input_raw, feature_columns)
 
-            pred_value = selected_model.predict(input_df)[0]
+            # Selected model result using decision threshold
+            pred_value, positive_prob, confidence, classes = get_model_prediction(
+                selected_model, input_df, threshold=threshold_value
+            )
             pred_text = label_to_text(pred_value)
 
-            proba, classes, confidence = get_model_prob_and_confidence(
-                selected_model, input_df, pred_value
-            )
+            # All-model disagreement
+            disagreement_df, disagreement_flag, prob_std, avg_prob = get_model_disagreement(models, input_df)
 
-            recommendation, risk = doctor_recommendation(tsh, fti, ratio, pred_text, confidence)
-            reasons = confidence_explanation(tsh, fti, ratio, confidence)
+            recommendation, risk = doctor_recommendation(
+                tsh, fti, tsh / (fti + 0.001), pred_text, confidence, disagreement=disagreement_flag
+            )
+            reasons = confidence_explanation(tsh, fti, tsh / (fti + 0.001), confidence)
 
         st.markdown("---")
 
@@ -832,8 +1102,11 @@ with tab1:
             st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
             st.markdown("#### 🧠 Clinical Interpretation")
             st.write(f"**TSH:** {tsh:.3f}")
+            st.write(f"**T3:** {t3:.3f}")
+            st.write(f"**TT4:** {tt4:.3f}")
+            st.write(f"**T4U:** {t4u:.3f}")
             st.write(f"**FTI:** {fti:.3f}")
-            st.write(f"**TSH/FTI Ratio:** {ratio:.5f}")
+            st.write(f"**TSH/FTI Ratio:** {tsh / (fti + 0.001):.5f}")
 
             if tsh > TSH_NORMAL[1]:
                 st.write("• TSH is high, which may indicate hypothyroid tendency.")
@@ -849,7 +1122,7 @@ with tab1:
             else:
                 st.write("• FTI is within the normal range.")
 
-            st.write("• TSH/FTI ratio helps the model capture hormone relationship and imbalance.")
+            st.write("• The engineered ratio and interaction features help capture hormone imbalance.")
             st.markdown("</div>", unsafe_allow_html=True)
 
         with res_col2:
@@ -859,6 +1132,8 @@ with tab1:
                     <h4 style="margin-top:0; margin-bottom:0.3rem;">🩺 Doctor Recommendation</h4>
                     <p style="margin:0.2rem 0 0.5rem 0;">{recommendation}</p>
                     <p style="margin:0;"><b>Risk level:</b> {risk}</p>
+                    <p style="margin:0;"><b>Model disagreement:</b> {"Yes" if disagreement_flag else "No"}</p>
+                    <p style="margin:0;"><b>Probability std:</b> {prob_std:.3f}</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -875,37 +1150,65 @@ with tab1:
             else:
                 st.error(f"Low confidence ({confidence:.2f}%)")
 
+            if disagreement_flag:
+                st.warning("Models are not fully agreeing on this case.")
             st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("### 🔍 Why confidence is high / low")
         for r in reasons:
             st.write("•", r)
 
+        st.markdown("### 🤖 Model Disagreement Analysis")
+        st.dataframe(disagreement_df, use_container_width=True)
+
         st.markdown("### 🧠 Explainable AI (SHAP)")
-        selected_explainer = get_shap_explainer(model_choice, selected_model)
-        if selected_explainer is not None:
-            try:
-                shap_values = selected_explainer(input_df)
-                fig, ax = plt.subplots(figsize=(11, 5))
-                shap.plots.waterfall(shap_values[0], show=False)
-                st.pyplot(fig, use_container_width=True, clear_figure=True)
-            except Exception as e:
-                st.info(f"SHAP waterfall could not be rendered in this run. ({e})")
-        else:
-            st.info("SHAP is shown for tree-based models like XGBoost / Random Forest / Decision Tree.")
+        try:
+            shap_model_name = tree_model_name
+            shap_model = tree_model
+            shap_explainer = get_shap_explainer(shap_model_name, shap_model, shap_background)
+            if shap_explainer is not None:
+                if shap_model_name in ["XGBoost", "Random Forest", "Decision Tree", "Stacking Ensemble"]:
+                    shap_values = shap_explainer(input_df)
+                    fig, ax = plt.subplots(figsize=(11, 5))
+                    shap.plots.waterfall(shap_values[0], show=False)
+                    st.pyplot(fig)
+                    plt.close(fig)
+                else:
+                    st.info("SHAP is shown mainly for tree-based models.")
+            else:
+                st.info("SHAP explanation is not available for the selected model.")
+        except Exception as e:
+            st.info(f"SHAP waterfall could not be rendered in this run. ({e})")
+
+        st.markdown("### 💡 LIME Explanation")
+        try:
+            lime_explainer = get_lime_explainer(X_train)
+            lime_model = selected_model
+
+            if hasattr(lime_model, "predict_proba"):
+                lime_exp = lime_explainer.explain_instance(
+                    data_row=input_df.iloc[0].values,
+                    predict_fn=lime_model.predict_proba,
+                    num_features=min(8, len(feature_columns))
+                )
+                lime_html = lime_exp.as_html()
+                components.html(lime_html, height=700, scrolling=True)
+            else:
+                st.info("Selected model does not support probability-based LIME explanation.")
+        except Exception as e:
+            st.info(f"LIME explanation could not be rendered in this run. ({e})")
 
         st.markdown("### 📈 Patient Live Chart")
         result_chart = make_live_chart(tsh, fti, pred_text)
-        st.plotly_chart(result_chart, use_container_width=True, key="result_chart")
+        st.plotly_chart(result_chart, use_container_width=True)
 
         st.markdown("### 📄 Export Report")
         pdf_bytes = make_pdf_report(
             patient_name,
             age,
             sex,
-            tsh,
-            fti,
-            ratio,
+            tsh, t3, tt4, t4u, fti,
+            tsh / (fti + 0.001),
             pred_text,
             confidence,
             recommendation,
@@ -928,7 +1231,7 @@ with tab2:
     st.markdown("### 📊 Multi-model Performance")
 
     comparison_fig = build_metric_chart(metrics_df)
-    st.plotly_chart(comparison_fig, use_container_width=True, key="comparison_chart")
+    st.plotly_chart(comparison_fig, use_container_width=True)
 
     best_row = metrics_df.loc[best_model_name]
     st.success(
@@ -942,11 +1245,11 @@ with tab2:
 
     st.markdown("### 📉 Confusion Matrix of Selected Model")
     cm_fig = build_confusion_figure(selected_metrics["CM"], f"{model_choice} Confusion Matrix")
-    st.plotly_chart(cm_fig, use_container_width=True, key="selected_cm")
+    st.plotly_chart(cm_fig, use_container_width=True)
 
     st.markdown("### 🏆 Best Model Confusion Matrix")
     best_cm_fig = build_confusion_figure(best_metrics["CM"], f"{best_model_name} Confusion Matrix")
-    st.plotly_chart(best_cm_fig, use_container_width=True, key="best_cm")
+    st.plotly_chart(best_cm_fig, use_container_width=True)
 
     st.markdown("### 📈 ROC Curve")
     if hasattr(selected_model, "predict_proba"):
@@ -966,7 +1269,7 @@ with tab2:
                 yaxis_title="True Positive Rate",
                 margin=dict(l=10, r=10, t=50, b=10),
             )
-            st.plotly_chart(roc_fig, use_container_width=True, key="roc_curve")
+            st.plotly_chart(roc_fig, use_container_width=True)
         except Exception as e:
             st.info(f"ROC curve could not be rendered. ({e})")
     else:
@@ -991,53 +1294,62 @@ with tab3:
 
     st.markdown("### 🥧 Disease Distribution")
     pie_fig = build_pie_chart(df_raw, target_col)
-    st.plotly_chart(pie_fig, use_container_width=True, key="pie_chart")
+    st.plotly_chart(pie_fig, use_container_width=True)
 
     st.markdown("### 🌡️ Correlation Heatmap")
     corr_fig = build_correlation_heatmap(df_raw, exclude_col=target_col)
     if corr_fig is not None:
-        st.plotly_chart(corr_fig, use_container_width=True, key="corr_heatmap")
+        st.plotly_chart(corr_fig, use_container_width=True)
     else:
         st.info("Correlation heatmap could not be generated because numeric columns are insufficient.")
 
     st.markdown("### 📈 Biomarker Trend")
     trend_fig = build_biomarker_trend(df_raw)
     if trend_fig is not None:
-        st.plotly_chart(trend_fig, use_container_width=True, key="trend_chart")
+        st.plotly_chart(trend_fig, use_container_width=True)
     else:
         st.info("Biomarker trend graph could not be generated.")
 
-    st.markdown("### 🌍 Global Explainability")
-    global_model_name = best_model_name
-    global_model = best_model
-    global_explainer = get_shap_explainer(global_model_name, global_model)
+    st.markdown("### 🔥 Feature Importance Consensus")
+    if consensus_importance_df is not None and not consensus_importance_df.empty:
+        top_consensus = consensus_importance_df.head(15).copy()
+        imp_fig = px.bar(
+            top_consensus.sort_values("Consensus Importance", ascending=True),
+            x="Consensus Importance",
+            y="Feature",
+            orientation="h",
+            title="Consensus Feature Importance"
+        )
+        imp_fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(imp_fig, use_container_width=True)
+        st.dataframe(top_consensus, use_container_width=True)
+    else:
+        st.info("Consensus feature importance could not be computed from the available models.")
 
-    if global_explainer is not None:
-        try:
+    st.markdown("### 🌍 Global Explainability")
+    try:
+        global_explainer = get_shap_explainer(tree_model_name, tree_model, shap_background)
+        if global_explainer is not None and tree_model_name in ["Stacking Ensemble", "XGBoost", "Random Forest", "Decision Tree"]:
             sample_n = min(120, len(X_train))
             background = X_train.sample(sample_n, random_state=42) if len(X_train) > sample_n else X_train.copy()
             shap_values = global_explainer(background)
+            vals = np.abs(shap_values.values).mean(axis=0)
+            imp_df = pd.DataFrame({"Feature": background.columns, "Importance": vals})
+            imp_df = imp_df.sort_values("Importance", ascending=False).head(15)
 
-            try:
-                vals = np.abs(shap_values.values).mean(axis=0)
-                imp_df = pd.DataFrame({"Feature": background.columns, "Importance": vals})
-                imp_df = imp_df.sort_values("Importance", ascending=False).head(15)
-
-                imp_fig = px.bar(
-                    imp_df.sort_values("Importance", ascending=True),
-                    x="Importance",
-                    y="Feature",
-                    orientation="h",
-                    title="Top SHAP Feature Importance"
-                )
-                imp_fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10, r=10, t=50, b=10))
-                st.plotly_chart(imp_fig, use_container_width=True, key="global_importance")
-            except Exception:
-                st.info("Could not render global feature importance chart.")
-        except Exception as e:
-            st.info(f"Global explainability unavailable. ({e})")
-    else:
-        st.info("Global explainability is available mainly for tree-based models.")
+            global_imp_fig = px.bar(
+                imp_df.sort_values("Importance", ascending=True),
+                x="Importance",
+                y="Feature",
+                orientation="h",
+                title="Top SHAP Feature Importance"
+            )
+            global_imp_fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(global_imp_fig, use_container_width=True)
+        else:
+            st.info("Global explainability is available mainly for tree-based models.")
+    except Exception as e:
+        st.info(f"Global explainability unavailable. ({e})")
 
 # =========================================================
 # TAB 4: BATCH PREDICTION
@@ -1056,26 +1368,27 @@ with tab4:
         if st.button("Run Batch Prediction", use_container_width=True):
             with st.spinner("Running batch prediction..."):
                 batch_raw = batch_df.copy()
-                batch_raw = normalize_for_model(batch_raw)
+                batch_raw = feature_engineering(batch_raw)
                 batch_raw = pd.get_dummies(batch_raw, drop_first=False)
                 batch_X = align_features(batch_raw, feature_columns)
 
                 preds = selected_model.predict(batch_X)
-                pred_texts = [label_to_text(p) for p in preds]
-
                 batch_result = batch_df.copy()
-                batch_result["AI_Result"] = pred_texts
+                batch_result["AI_Result"] = ["Positive" if x == 1 else "Negative" for x in preds]
 
                 if hasattr(selected_model, "predict_proba"):
-                    probs = selected_model.predict_proba(batch_X)
-                    classes = list(selected_model.classes_) if hasattr(selected_model, "classes_") else None
-                    confs = []
-                    for i, p in enumerate(preds):
-                        if classes is not None and p in classes:
-                            confs.append(float(probs[i][classes.index(p)]) * 100)
-                        else:
-                            confs.append(float(np.max(probs[i])) * 100)
-                    batch_result["Confidence"] = np.round(confs, 2)
+                    try:
+                        probs = selected_model.predict_proba(batch_X)
+                        classes = list(selected_model.classes_) if hasattr(selected_model, "classes_") else None
+                        confs = []
+                        for i, p in enumerate(preds):
+                            if classes is not None and p in classes:
+                                confs.append(float(probs[i][classes.index(p)]) * 100)
+                            else:
+                                confs.append(float(np.max(probs[i])) * 100)
+                        batch_result["Confidence"] = np.round(confs, 2)
+                    except Exception:
+                        pass
 
             st.success("Batch prediction completed.")
             st.dataframe(batch_result, use_container_width=True)
