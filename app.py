@@ -680,12 +680,26 @@ def build_consensus_importance(models_dict, feature_names):
 
 def get_shap_explainer(model_name, model, background):
     try:
-        if model_name in ["Stacking Ensemble", "XGBoost", "Random Forest", "Decision Tree", "Best Model", "Ensemble (RF + XGB)"]:
+
+        # Ensemble model এ SHAP disable
+        if "Ensemble" in model_name or "Stacking" in model_name:
+            return None
+
+        # Tree based models
+        if model_name in ["XGBoost", "Random Forest", "Decision Tree", "Best Model"]:
             return shap.TreeExplainer(model)
+
+        # Linear models
         if hasattr(model, "coef_"):
-            return shap.LinearExplainer(model, background, feature_perturbation="interventional")
+            return shap.LinearExplainer(
+                model,
+                background,
+                feature_perturbation="interventional"
+            )
+
     except Exception:
         return None
+
     return None
 
 def get_lime_explainer(background_df):
