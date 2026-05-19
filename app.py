@@ -25,7 +25,11 @@ from sklearn.metrics import (
     auc
 )
 
-from lime.lime_tabular import LimeTabularExplainer
+try:
+    from lime.lime_tabular import LimeTabularExplainer
+    LIME_AVAILABLE = True
+except Exception:
+    LIME_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
 
@@ -152,15 +156,23 @@ def normalize_target(series):
 
         def map_target(v):
             v = str(v).strip().lower()
-            if v in ["1", "true", "yes", "positive", "disease", "diseased", "abnormal", "hyper", "hypo", "present"]:
+            positive = [
+                "1", "true", "yes", "positive", "disease", "diseased", "abnormal",
+                "hyper", "hypo", "present", "p", "pos", "d", "y", "t"
+            ]
+            negative = [
+                "0", "false", "no", "negative", "normal", "healthy", "ok", "absent",
+                "n", "neg", "f"
+            ]
+            if v in positive:
                 return 1
-            if v in ["0", "false", "no", "negative", "normal", "healthy", "ok", "absent"]:
+            if v in negative:
                 return 0
             if "positive" in v or "disease" in v or "abnormal" in v:
                 return 1
             if "negative" in v or "normal" in v or "healthy" in v:
                 return 0
-            return 1 if v not in ["0", "false", "no"] else 0
+            return 1 if v not in ["0", "false", "no", "n", "neg", "f"] else 0
 
         return s.map(map_target).astype(int)
 
@@ -188,7 +200,6 @@ def feature_engineering(df):
     else:
         df["Age_TSH_Interaction"] = 0
 
-    # Hormone imbalance score: simple weighted score for clinical interaction
     for col in ["TSH", "T3", "TT4", "T4U", "FTI"]:
         if col not in df.columns:
             df[col] = 0
@@ -301,12 +312,10 @@ def build_patient_raw_input(template_df, age, sex, tsh, t3, tt4, t4u, fti, flags
         if col in row:
             row[col] = value
 
-    # Optional clinical flags
     for key, value in flags.items():
         if key in row:
             row[key] = value
 
-    # Derived features
     if "TSH_FTI_Ratio" in row:
         row["TSH_FTI_Ratio"] = tsh / (fti + 0.001)
 
@@ -671,7 +680,7 @@ def build_consensus_importance(models_dict, feature_names):
 
 def get_shap_explainer(model_name, model, background):
     try:
-        if model_name in ["Stacking Ensemble", "XGBoost", "Random Forest", "Decision Tree", "Best Model"]:
+        if model_name in ["Stacking Ensemble", "XGBoost", "Random Forest", "Decision Tree", "Best Model", "Ensemble (RF + XGB)"]:
             return shap.TreeExplainer(model)
         if hasattr(model, "coef_"):
             return shap.LinearExplainer(model, background, feature_perturbation="interventional")
@@ -705,7 +714,7 @@ def get_model_disagreement(models_dict, input_df):
                 "Positive Probability": None if positive_prob is None else round(positive_prob * 100, 2),
                 "Confidence %": round(confidence, 2)
             })
-        except Exception as e:
+        except Exception:
             rows.append({
                 "Model": name,
                 "Prediction": "Error",
@@ -746,8 +755,62 @@ def predict_row_with_threshold(model, input_df, threshold=0.5):
         pred = 1 if positive_prob >= threshold else 0
     return pred, positive_prob, confidence
 
+class SoftVotingEnsemble:
+    def __init__(self, models_list, feature_columns):
+        self.models_list = models_list
+        self.feature_columns = list(feature_columns)
+        self.classes_ = np.array([0, 1])
+
+    def _to_frame(self, X):
+        if isinstance(X, pd.DataFrame):
+            df = X.copy()
+        else:
+            arr = np.array(X)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            cols = self.feature_columns[:arr.shape[1]]
+            df = pd.DataFrame(arr, columns=cols)
+
+        return align_features(df, self.feature_columns)
+
+    def predict_proba(self, X):
+        X_df = self._to_frame(X)
+        probas = []
+
+        for model in self.models_list:
+            try:
+                if hasattr(model, "predict_proba"):
+                    p = model.predict_proba(X_df)
+                    p = np.asarray(p)
+                    if p.ndim == 1:
+                        p = np.vstack([1 - p, p]).T
+                    elif p.shape[1] == 1:
+                        p = np.hstack([1 - p, p])
+                    probas.append(p)
+            except Exception:
+                pass
+
+        if len(probas) == 0:
+            preds = []
+            for model in self.models_list:
+                try:
+                    preds.append(np.asarray(model.predict(X_df)).astype(float))
+                except Exception:
+                    pass
+            if len(preds) == 0:
+                return np.array([[0.5, 0.5]] * len(X_df))
+            avg_pred = np.mean(np.vstack(preds), axis=0)
+            return np.vstack([1 - avg_pred, avg_pred]).T
+
+        avg_proba = np.mean(np.stack(probas, axis=0), axis=0)
+        return avg_proba
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return (proba[:, 1] >= 0.5).astype(int)
+
 # =========================================================
-# USERS / LOGIN
+# LOGIN
 # =========================================================
 try:
     with open("users.json") as f:
@@ -850,6 +913,15 @@ X_train, X_test, y_train, y_test = train_test_split(
 )
 
 # =========================================================
+# OPTIONAL 2-MODEL ENSEMBLE (RF + XGB)
+# =========================================================
+if "Random Forest" in models and "XGBoost" in models and "Ensemble (RF + XGB)" not in models:
+    models["Ensemble (RF + XGB)"] = SoftVotingEnsemble(
+        [models["Random Forest"], models["XGBoost"]],
+        feature_columns
+    )
+
+# =========================================================
 # LOAD THRESHOLD
 # =========================================================
 threshold_value = 0.5
@@ -924,7 +996,7 @@ best_metrics = model_scores[best_model_name]
 
 # Tree-based model for SHAP
 tree_model_name = None
-for candidate in ["Stacking Ensemble", "XGBoost", "Random Forest", "Decision Tree"]:
+for candidate in ["Stacking Ensemble", "Ensemble (RF + XGB)", "XGBoost", "Random Forest", "Decision Tree"]:
     if candidate in models:
         tree_model_name = candidate
         break
@@ -934,7 +1006,10 @@ if tree_model_name is None:
 tree_model = models[tree_model_name]
 shap_background = X_train.sample(min(150, len(X_train)), random_state=42) if len(X_train) > 150 else X_train.copy()
 
-consensus_importance_df = build_consensus_importance(models, feature_columns)
+consensus_importance_df = build_consensus_importance(
+    {k: v for k, v in models.items() if k != "Ensemble (RF + XGB)"},
+    feature_columns
+)
 
 # =========================================================
 # SIDEBAR
@@ -1057,13 +1132,11 @@ with tab1:
             )
             input_df = prepare_input_features(input_raw, feature_columns)
 
-            # Selected model result using decision threshold
             pred_value, positive_prob, confidence, classes = get_model_prediction(
                 selected_model, input_df, threshold=threshold_value
             )
             pred_text = label_to_text(pred_value)
 
-            # All-model disagreement
             disagreement_df, disagreement_flag, prob_std, avg_prob = get_model_disagreement(models, input_df)
 
             recommendation, risk = doctor_recommendation(
@@ -1134,6 +1207,7 @@ with tab1:
                     <p style="margin:0;"><b>Risk level:</b> {risk}</p>
                     <p style="margin:0;"><b>Model disagreement:</b> {"Yes" if disagreement_flag else "No"}</p>
                     <p style="margin:0;"><b>Probability std:</b> {prob_std:.3f}</p>
+                    <p style="margin:0;"><b>Average probability:</b> {avg_prob if avg_prob is not None else "N/A"}</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1163,40 +1237,38 @@ with tab1:
 
         st.markdown("### 🧠 Explainable AI (SHAP)")
         try:
-            shap_model_name = tree_model_name
-            shap_model = tree_model
-            shap_explainer = get_shap_explainer(shap_model_name, shap_model, shap_background)
-            if shap_explainer is not None:
-                if shap_model_name in ["XGBoost", "Random Forest", "Decision Tree", "Stacking Ensemble"]:
-                    shap_values = shap_explainer(input_df)
-                    fig, ax = plt.subplots(figsize=(11, 5))
-                    shap.plots.waterfall(shap_values[0], show=False)
-                    st.pyplot(fig)
-                    plt.close(fig)
-                else:
-                    st.info("SHAP is shown mainly for tree-based models.")
+            shap_explainer = get_shap_explainer(tree_model_name, tree_model, shap_background)
+            if shap_explainer is not None and tree_model_name in [
+                "Stacking Ensemble", "Ensemble (RF + XGB)", "XGBoost", "Random Forest", "Decision Tree"
+            ]:
+                shap_values = shap_explainer(input_df)
+                fig, ax = plt.subplots(figsize=(11, 5))
+                shap.plots.waterfall(shap_values[0], show=False)
+                st.pyplot(fig)
+                plt.close(fig)
             else:
-                st.info("SHAP explanation is not available for the selected model.")
+                st.info("SHAP is shown mainly for tree-based models.")
         except Exception as e:
             st.info(f"SHAP waterfall could not be rendered in this run. ({e})")
 
         st.markdown("### 💡 LIME Explanation")
-        try:
-            lime_explainer = get_lime_explainer(X_train)
-            lime_model = selected_model
-
-            if hasattr(lime_model, "predict_proba"):
-                lime_exp = lime_explainer.explain_instance(
-                    data_row=input_df.iloc[0].values,
-                    predict_fn=lime_model.predict_proba,
-                    num_features=min(8, len(feature_columns))
-                )
-                lime_html = lime_exp.as_html()
-                components.html(lime_html, height=700, scrolling=True)
-            else:
-                st.info("Selected model does not support probability-based LIME explanation.")
-        except Exception as e:
-            st.info(f"LIME explanation could not be rendered in this run. ({e})")
+        if LIME_AVAILABLE:
+            try:
+                lime_explainer = get_lime_explainer(X_train)
+                if hasattr(selected_model, "predict_proba"):
+                    lime_exp = lime_explainer.explain_instance(
+                        data_row=input_df.iloc[0].values,
+                        predict_fn=selected_model.predict_proba,
+                        num_features=min(8, len(feature_columns))
+                    )
+                    lime_html = lime_exp.as_html()
+                    components.html(lime_html, height=700, scrolling=True)
+                else:
+                    st.info("Selected model does not support probability-based LIME explanation.")
+            except Exception as e:
+                st.info(f"LIME explanation could not be rendered in this run. ({e})")
+        else:
+            st.info("LIME package is not installed in this deployment.")
 
         st.markdown("### 📈 Patient Live Chart")
         result_chart = make_live_chart(tsh, fti, pred_text)
@@ -1329,7 +1401,9 @@ with tab3:
     st.markdown("### 🌍 Global Explainability")
     try:
         global_explainer = get_shap_explainer(tree_model_name, tree_model, shap_background)
-        if global_explainer is not None and tree_model_name in ["Stacking Ensemble", "XGBoost", "Random Forest", "Decision Tree"]:
+        if global_explainer is not None and tree_model_name in [
+            "Stacking Ensemble", "Ensemble (RF + XGB)", "XGBoost", "Random Forest", "Decision Tree"
+        ]:
             sample_n = min(120, len(X_train))
             background = X_train.sample(sample_n, random_state=42) if len(X_train) > sample_n else X_train.copy()
             shap_values = global_explainer(background)
