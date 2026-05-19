@@ -157,12 +157,12 @@ def normalize_target(series):
         def map_target(v):
             v = str(v).strip().lower()
             positive = [
-                "1", "true", "yes", "positive", "disease", "diseased", "abnormal",
-                "hyper", "hypo", "present", "p", "pos", "d", "y", "t"
+                "1", "true", "yes", "positive", "disease", "diseased",
+                "abnormal", "hyper", "hypo", "present", "p", "pos"
             ]
             negative = [
-                "0", "false", "no", "negative", "normal", "healthy", "ok", "absent",
-                "n", "neg", "f"
+                "0", "false", "no", "negative", "normal", "healthy",
+                "ok", "absent", "n", "neg"
             ]
             if v in positive:
                 return 1
@@ -172,7 +172,7 @@ def normalize_target(series):
                 return 1
             if "negative" in v or "normal" in v or "healthy" in v:
                 return 0
-            return 1 if v not in ["0", "false", "no", "n", "neg", "f"] else 0
+            return 1 if v not in ["0", "false", "no", "n", "neg"] else 0
 
         return s.map(map_target).astype(int)
 
@@ -240,8 +240,12 @@ def feature_engineering(df):
 
 @st.cache_data
 def load_dataset():
-    df = pd.read_csv("cleaned_dataset_Thyroid1.csv")
-    return clean_columns(df)
+    try:
+        df = pd.read_csv("cleaned_dataset_Thyroid1.csv")
+        return clean_columns(df)
+    except Exception as e:
+        st.error(f"Dataset file not found or could not be loaded: {e}")
+        st.stop()
 
 @st.cache_resource
 def load_model_file(path):
@@ -258,11 +262,17 @@ def get_available_model_files():
     }
     available = {}
     for name, file in model_files.items():
-        if Path(file).exists():
-            available[name] = file
+        candidates = [Path(file), Path("models") / file]
+        for c in candidates:
+            if c.exists():
+                available[name] = str(c)
+                break
 
-    if not available and Path("thyroid_model.pkl").exists():
-        available["Best Model"] = "thyroid_model.pkl"
+    if not available:
+        for fallback in ["thyroid_model.pkl", "models/thyroid_model.pkl"]:
+            if Path(fallback).exists():
+                available["Best Model"] = fallback
+                break
 
     return available
 
@@ -272,6 +282,9 @@ def align_features(df, feature_columns):
     for col in feature_columns:
         if col not in out.columns:
             out[col] = 0
+    extra_cols = [c for c in out.columns if c not in feature_columns]
+    if extra_cols:
+        out = out.drop(columns=extra_cols)
     out = out[feature_columns]
     out = out.apply(pd.to_numeric, errors="coerce").fillna(0)
     return out
@@ -292,15 +305,13 @@ def build_default_raw_row(template_df):
 def build_patient_raw_input(template_df, age, sex, tsh, t3, tt4, t4u, fti, flags):
     row = build_default_raw_row(template_df)
 
-    if "age" in row:
-        row["age"] = age
-    if "Age" in row:
-        row["Age"] = age
+    for key in ["age", "Age"]:
+        if key in row:
+            row[key] = age
 
-    if "sex" in row:
-        row["sex"] = 1 if sex == "Male" else 0
-    if "Sex" in row:
-        row["Sex"] = 1 if sex == "Male" else 0
+    for key in ["sex", "Sex"]:
+        if key in row:
+            row[key] = 1 if sex == "Male" else 0
 
     for col, value in {
         "TSH": tsh,
@@ -318,10 +329,8 @@ def build_patient_raw_input(template_df, age, sex, tsh, t3, tt4, t4u, fti, flags
 
     if "TSH_FTI_Ratio" in row:
         row["TSH_FTI_Ratio"] = tsh / (fti + 0.001)
-
     if "Age_TSH_Interaction" in row:
         row["Age_TSH_Interaction"] = age * tsh
-
     if "Hormone_Imbalance_Score" in row:
         row["Hormone_Imbalance_Score"] = (
             (0.30 * tsh) +
@@ -378,22 +387,19 @@ def predict_proba_safe(model, input_df):
     return None, None
 
 def get_model_prediction(model, input_df, threshold=0.5):
-    pred = None
-    positive_prob = None
-    classes = None
-
     proba, classes = predict_proba_safe(model, input_df)
+
     if proba is not None:
         positive_prob = float(proba[1]) if len(proba) > 1 else float(np.max(proba))
         pred = 1 if positive_prob >= threshold else 0
-    else:
-        try:
-            pred = int(model.predict(input_df)[0])
-        except Exception:
-            pred = 0
+        confidence = choose_confidence(pred, proba, classes)
+        return pred, positive_prob, confidence, classes
 
-    confidence = choose_confidence(pred, proba, classes) if proba is not None else 100.0
-    return pred, positive_prob, confidence, classes
+    try:
+        pred = int(model.predict(input_df)[0])
+    except Exception:
+        pred = 0
+    return pred, None, 100.0, None
 
 def doctor_recommendation(tsh, fti, ratio, verdict_text, confidence, disagreement=False):
     if tsh > TSH_NORMAL[1] and fti < FTI_NORMAL[0]:
@@ -419,12 +425,10 @@ def doctor_recommendation(tsh, fti, ratio, verdict_text, confidence, disagreemen
             risk = "High"
         elif risk == "High":
             risk = "Critical"
-
     return rec, risk
 
 def confidence_explanation(tsh, fti, ratio, confidence):
     reasons = []
-
     if confidence < 70:
         if TSH_NORMAL[0] <= tsh <= TSH_NORMAL[1]:
             reasons.append("TSH is close to the normal range, so the pattern is less clear.")
@@ -440,10 +444,8 @@ def confidence_explanation(tsh, fti, ratio, confidence):
         reasons.append("The input shows a mixed pattern: some values are normal while others are mildly abnormal.")
     else:
         reasons.append("The input values form a clear pattern, so the model is confident.")
-
     if not reasons:
         reasons.append("The model detected a strong clinical pattern.")
-
     return reasons
 
 def make_live_chart(tsh, fti, verdict_text=None):
@@ -454,7 +456,6 @@ def make_live_chart(tsh, fti, verdict_text=None):
         point_color = "#22c55e"
 
     fig = go.Figure()
-
     fig.add_shape(
         type="rect",
         x0=FTI_NORMAL[0], x1=FTI_NORMAL[1],
@@ -463,12 +464,10 @@ def make_live_chart(tsh, fti, verdict_text=None):
         line=dict(color="rgba(34,197,94,0.55)", width=2),
         layer="below",
     )
-
     fig.add_vline(x=FTI_NORMAL[0], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
     fig.add_vline(x=FTI_NORMAL[1], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
     fig.add_hline(y=TSH_NORMAL[0], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
     fig.add_hline(y=TSH_NORMAL[1], line_width=1, line_dash="dash", line_color="rgba(34,197,94,0.55)")
-
     fig.add_trace(
         go.Scatter(
             x=[fti],
@@ -480,7 +479,6 @@ def make_live_chart(tsh, fti, verdict_text=None):
             name="Patient Point",
         )
     )
-
     fig.update_layout(
         template="plotly_dark",
         height=460,
@@ -600,7 +598,6 @@ def make_pdf_report(name, age, sex, tsh, t3, tt4, t4u, fti, ratio, verdict, conf
 
     pdf.set_font("Arial", "B", 18)
     pdf.cell(0, 10, "Thyroid AI Diagnostic Report", ln=True, align="C")
-
     pdf.set_font("Arial", "", 10)
     pdf.cell(0, 8, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align="C")
     pdf.ln(4)
@@ -678,28 +675,16 @@ def build_consensus_importance(models_dict, feature_names):
     out.columns = ["Feature", "Consensus Importance"]
     return out
 
-def get_shap_explainer(model_name, model, background):
+def get_shap_explainer(model_name, model, background=None):
     try:
-
-        # Ensemble model এ SHAP disable
         if "Ensemble" in model_name or "Stacking" in model_name:
             return None
-
-        # Tree based models
         if model_name in ["XGBoost", "Random Forest", "Decision Tree", "Best Model"]:
             return shap.TreeExplainer(model)
-
-        # Linear models
-        if hasattr(model, "coef_"):
-            return shap.LinearExplainer(
-                model,
-                background,
-                feature_perturbation="interventional"
-            )
-
+        if hasattr(model, "coef_") and background is not None:
+            return shap.LinearExplainer(model, background)
     except Exception:
         return None
-
     return None
 
 def get_lime_explainer(background_df):
@@ -739,7 +724,6 @@ def get_model_disagreement(models_dict, input_df):
     disagree = len(set(preds)) > 1 if preds else False
     prob_std = float(np.std(probs)) if len(probs) > 1 else 0.0
     avg_prob = float(np.mean(probs)) if len(probs) > 0 else None
-
     return pd.DataFrame(rows), disagree, prob_std, avg_prob
 
 def escalate_risk(risk):
@@ -763,12 +747,6 @@ def final_risk_level(confidence, disagreement=False, prob_std=0.0):
         risk = escalate_risk(risk)
     return risk
 
-def predict_row_with_threshold(model, input_df, threshold=0.5):
-    pred, positive_prob, confidence, classes = get_model_prediction(model, input_df, threshold=threshold)
-    if positive_prob is not None:
-        pred = 1 if positive_prob >= threshold else 0
-    return pred, positive_prob, confidence
-
 class SoftVotingEnsemble:
     def __init__(self, models_list, feature_columns):
         self.models_list = models_list
@@ -784,7 +762,6 @@ class SoftVotingEnsemble:
                 arr = arr.reshape(1, -1)
             cols = self.feature_columns[:arr.shape[1]]
             df = pd.DataFrame(arr, columns=cols)
-
         return align_features(df, self.feature_columns)
 
     def predict_proba(self, X):
@@ -874,7 +851,6 @@ if target_col is None:
 raw_features_df = df_raw.drop(columns=[target_col]).copy()
 raw_features_df = clean_columns(raw_features_df)
 raw_features_df = feature_engineering(raw_features_df)
-
 y_all = normalize_target(df_raw[target_col])
 
 # =========================================================
@@ -882,7 +858,6 @@ y_all = normalize_target(df_raw[target_col])
 # =========================================================
 available_model_files = get_available_model_files()
 models = {}
-
 for name, path in available_model_files.items():
     try:
         models[name] = load_model_file(path)
@@ -907,10 +882,7 @@ else:
         if hasattr(m, "feature_names_in_"):
             model_feature_cols = list(m.feature_names_in_)
             break
-    if model_feature_cols is not None:
-        feature_columns = model_feature_cols
-    else:
-        feature_columns = pd.get_dummies(raw_features_df, drop_first=False).columns.tolist()
+    feature_columns = model_feature_cols if model_feature_cols is not None else pd.get_dummies(raw_features_df, drop_first=False).columns.tolist()
 
 X_all = pd.get_dummies(raw_features_df, drop_first=False)
 X_all = align_features(X_all, feature_columns)
@@ -927,7 +899,7 @@ X_train, X_test, y_train, y_test = train_test_split(
 )
 
 # =========================================================
-# OPTIONAL 2-MODEL ENSEMBLE (RF + XGB)
+# 2-MODEL ENSEMBLE
 # =========================================================
 if "Random Forest" in models and "XGBoost" in models and "Ensemble (RF + XGB)" not in models:
     models["Ensemble (RF + XGB)"] = SoftVotingEnsemble(
@@ -936,7 +908,7 @@ if "Random Forest" in models and "XGBoost" in models and "Ensemble (RF + XGB)" n
     )
 
 # =========================================================
-# LOAD THRESHOLD
+# THRESHOLD
 # =========================================================
 threshold_value = 0.5
 for p in ["threshold_value.pkl", "threshold.pkl"]:
@@ -1008,7 +980,6 @@ best_model_name = metrics_df.index[0]
 best_model = models[best_model_name]
 best_metrics = model_scores[best_model_name]
 
-# Tree-based model for SHAP
 tree_model_name = None
 for candidate in ["Stacking Ensemble", "Ensemble (RF + XGB)", "XGBoost", "Random Forest", "Decision Tree"]:
     if candidate in models:
@@ -1020,10 +991,8 @@ if tree_model_name is None:
 tree_model = models[tree_model_name]
 shap_background = X_train.sample(min(150, len(X_train)), random_state=42) if len(X_train) > 150 else X_train.copy()
 
-consensus_importance_df = build_consensus_importance(
-    {k: v for k, v in models.items() if k != "Ensemble (RF + XGB)"},
-    feature_columns
-)
+consensus_importance_df = build_consensus_importance(models, feature_columns)
+base_models_for_disagreement = {k: v for k, v in models.items() if k in ["XGBoost", "Random Forest", "Logistic Regression", "Decision Tree", "SVM"]}
 
 # =========================================================
 # SIDEBAR
@@ -1144,14 +1113,14 @@ with tab1:
                 raw_features_df,
                 age, sex, tsh, t3, tt4, t4u, fti, flags
             )
-            input_df = prepare_input_features(input_raw, feature_columns)
+            input_df = prepare_input_features(input_raw, feature_columns).astype(float)
 
             pred_value, positive_prob, confidence, classes = get_model_prediction(
                 selected_model, input_df, threshold=threshold_value
             )
             pred_text = label_to_text(pred_value)
 
-            disagreement_df, disagreement_flag, prob_std, avg_prob = get_model_disagreement(models, input_df)
+            disagreement_df, disagreement_flag, prob_std, avg_prob = get_model_disagreement(base_models_for_disagreement, input_df)
 
             recommendation, risk = doctor_recommendation(
                 tsh, fti, tsh / (fti + 0.001), pred_text, confidence, disagreement=disagreement_flag
@@ -1221,7 +1190,7 @@ with tab1:
                     <p style="margin:0;"><b>Risk level:</b> {risk}</p>
                     <p style="margin:0;"><b>Model disagreement:</b> {"Yes" if disagreement_flag else "No"}</p>
                     <p style="margin:0;"><b>Probability std:</b> {prob_std:.3f}</p>
-                    <p style="margin:0;"><b>Average probability:</b> {avg_prob if avg_prob is not None else "N/A"}</p>
+                    <p style="margin:0;"><b>Average positive probability:</b> {avg_prob if avg_prob is not None else "N/A"}</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1256,10 +1225,10 @@ with tab1:
                 "Stacking Ensemble", "Ensemble (RF + XGB)", "XGBoost", "Random Forest", "Decision Tree"
             ]:
                 shap_values = shap_explainer(input_df)
-                fig, ax = plt.subplots(figsize=(11, 5))
+                plt.figure(figsize=(11, 5))
                 shap.plots.waterfall(shap_values[0], show=False)
-                st.pyplot(fig)
-                plt.close(fig)
+                st.pyplot(plt.gcf())
+                plt.close()
             else:
                 st.info("SHAP is shown mainly for tree-based models.")
         except Exception as e:
@@ -1458,7 +1427,7 @@ with tab4:
                 batch_raw = batch_df.copy()
                 batch_raw = feature_engineering(batch_raw)
                 batch_raw = pd.get_dummies(batch_raw, drop_first=False)
-                batch_X = align_features(batch_raw, feature_columns)
+                batch_X = align_features(batch_raw, feature_columns).astype(float)
 
                 preds = selected_model.predict(batch_X)
                 batch_result = batch_df.copy()
